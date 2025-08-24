@@ -107,7 +107,7 @@ def empty_week_plan(normal_start: str = "06:30", normal_end: str = "17:00",
                 wins.append(Window(abs_start, abs_end, "Absenk"))
             else:
                 if d == 5:
-                    wins.append(Window("08:00", "14:00", "Absenk", V_override_m3h=3000))
+                    wins.append(Window("08:00", "14:00", "Absenk", V_override_m3h=3000.0))
                 # So: aus (keine Fenster)
         week.append(DayPlan(day=d, windows=wins))
     return week
@@ -364,8 +364,8 @@ with st.expander("3) Anlage konfigurieren", expanded=True):
             w.start = cc[0].text_input("Start", key=f"start_{d}_{w_idx}", value=w.start)
             w.end = cc[1].text_input("Ende", key=f"end_{d}_{w_idx}", value=w.end)
             w.mode = cc[2].selectbox("Modus", ["Normal", "Absenk"], key=f"mode_{d}_{w_idx}", index=(0 if w.mode=="Normal" else 1))
-            w.T_override_C = cc[3].number_input("T_override [°C]", key=f"To_{d}_{w_idx}", value=w.T_override_C if w.T_override_C is not None else 0.0)
-            w.V_override_m3h = cc[4].number_input("V_override [m³/h]", key=f"Vo_{d}_{w_idx}", value=w.V_override_m3h if w.V_override_m3h is not None else 0.0, min_value=0.0, max_value=500000.0, step=100.0)
+            w.T_override_C = cc[3].number_input("T_override [°C]", key=f"To_{d}_{w_idx}", value=float(w.T_override_C) if w.T_override_C is not None else 0.0, step=0.5)
+            w.V_override_m3h = cc[4].number_input("V_override [m³/h]", key=f"Vo_{d}_{w_idx}", value=float(w.V_override_m3h) if w.V_override_m3h is not None else 0.0, min_value=0.0, max_value=500000.0, step=100.0)
             if cc[5].button("–", key=f"del_{d}_{w_idx}"):
                 day.windows.pop(w_idx)
                 st.experimental_rerun()
