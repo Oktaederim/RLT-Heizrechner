@@ -214,24 +214,41 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
     if not REPORTLAB_OK:
         raise RuntimeError("ReportLab ist nicht installiert.")
 
+    from reportlab.pdfbase import pdfmetrics
+
     buf = io.BytesIO()
     c = pdfcanvas.Canvas(buf, pagesize=A4)
     W, H = A4
     x, y = 20*mm, H - 20*mm
+    max_width = W - 40*mm
+
+    def wrap_lines(txt: str, font_name: str, font_size: int) -> list[str]:
+        """Einfache Wort‑Umbrüche auf max_width."""
+        lines_out: list[str] = []
+        for raw_line in txt.split("\n"):
+            words = raw_line.split(" ")
+            line = ""
+            for w in words:
+                test = (line + (" " if line else "") + w).strip()
+                if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                    line = test
+                else:
+                    if line:
+                        lines_out.append(line)
+                    line = w
+            lines_out.append(line)
+        return lines_out
 
     def line(txt: str, size=10, bold=False, gap=4):
         nonlocal y
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
-        for part in c.beginText(x, y).textLines(txt).getPickled():
-            pass
-        # simple wrapping
-        for t in txt.split("\n"):
-            c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        font = "Helvetica-Bold" if bold else "Helvetica"
+        c.setFont(font, size)
+        for t in wrap_lines(txt, font, size):
             c.drawString(x, y, t)
             y -= (size + gap)
             if y < 30*mm:
-                c.showPage(); y = H - 20*mm
-        
+                c.showPage(); y = H - 20*mm; c.setFont(font, size)
+
     line("ISO 50001 – Heizenergieabschätzung Lüftungsanlagen (v1)", 14, True)
     line(f"Erzeugt: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
@@ -258,7 +275,7 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
         line(f"{int(r['year'])}-{int(r['month']):02d}  |  th {r['kWh_th']:.0f}  |  el {r['kWh_el']:.0f}  |  h {r['fan_hours']:.0f}", 10)
 
     line("6. Limitierungen & Hinweise", 12, True)
-    line("Vereinfachtes Modell: konstante Luftdichte/c_p (0,34), keine Feuchte-/Bypass-Logik, Ventilator linear mit Volumenstrom. Genauigkeit abhängig von Parametrierung und Lastprofil.")
+    line("Vereinfachtes Modell: konstante Luftdichte/c_p (0,34), keine Feuchte-/Bypass‑Logik, Ventilator linear mit Volumenstrom. Genauigkeit abhängig von Parametrierung und Lastprofil.")
 
     c.save()
     buf.seek(0)
