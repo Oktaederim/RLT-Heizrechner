@@ -207,6 +207,52 @@ def compute(try_df: pd.DataFrame, plant: Plant, defaults: Defaults) -> Tuple[pd.
     return monthly, yearly
 
 # ------------------------------
+# Excel-Export
+# ------------------------------
+from io import BytesIO
+
+def build_excel(plant: Plant, monthly: pd.DataFrame, yearly: pd.DataFrame) -> bytes:
+    """Erzeugt eine formatierte XLSX mit getrennten Blättern und sauberen Zahlformaten."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # Kopien mit gerundeten Werten (Lesbarkeit)
+        m = monthly.copy()
+        y = yearly.copy()
+        for col in ("kWh_th", "kWh_el"):
+            if col in m: m[col] = m[col].round(0)
+            if col in y: y[col] = y[col].round(0)
+        if "fan_hours" in m: m["fan_hours"] = m["fan_hours"].round(1)
+        if "fan_hours" in y: y["fan_hours"] = y["fan_hours"].round(1)
+
+        m.to_excel(writer, index=False, sheet_name="Monate")
+        y.to_excel(writer, index=False, sheet_name="Jahreswerte")
+
+        wb  = writer.book
+        fmt_int  = wb.add_format({"num_format": "#,##0"})
+        fmt_1dec = wb.add_format({"num_format": "#,##0.0"})
+        fmt_hdr  = wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1})
+
+        for sh in ("Monate", "Jahreswerte"):
+            ws = writer.sheets[sh]
+            # Kopfzeile formatieren
+            ws.set_row(0, 20, fmt_hdr)
+            # Spaltenbreiten & Formate setzen
+            headers = [c for c in (m.columns if sh=="Monate" else y.columns)]
+            for i, col in enumerate(headers):
+                if col in ("kWh_th", "kWh_el"):
+                    ws.set_column(i, i, 14, fmt_int)
+                elif col == "fan_hours":
+                    ws.set_column(i, i, 14, fmt_1dec)
+                else:
+                    ws.set_column(i, i, 12)
+            # Auto-Filter an
+            ws.autofilter(0, 0, (len(m) if sh=="Monate" else len(y)), len(headers)-1)
+            # Kopf fixieren
+            ws.freeze_panes(1, 0)
+
+    return output.getvalue()
+
+# ------------------------------
 # PDF-Export (übersichtlich mit Platypus)
 # ------------------------------
 def build_pdf(try_info: str, defaults: Defaults, plant: Plant,
