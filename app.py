@@ -207,81 +207,120 @@ def compute(try_df: pd.DataFrame, plant: Plant, defaults: Defaults) -> Tuple[pd.
     return monthly, yearly
 
 # ------------------------------
-# PDF-Export
+# PDF-Export (übersichtlich mit Platypus)
 # ------------------------------
-
-def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataFrame, yearly: pd.DataFrame) -> bytes:
+def build_pdf(try_info: str, defaults: Defaults, plant: Plant,
+              monthly: pd.DataFrame, yearly: pd.DataFrame) -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("ReportLab ist nicht installiert.")
 
-    from reportlab.pdfbase import pdfmetrics
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    from datetime import datetime
 
-    buf = io.BytesIO()
-    c = pdfcanvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    x, y = 20*mm, H - 20*mm
-    max_width = W - 40*mm
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18*mm, rightMargin=18*mm,
+        topMargin=18*mm, bottomMargin=18*mm
+    )
+    styles = getSampleStyleSheet()
+    H1 = styles["Heading1"]; H1.fontSize = 14
+    H2 = styles["Heading2"]; H2.fontSize = 12
+    N  = styles["BodyText"]; N.leading = 14
 
-    def wrap_lines(txt: str, font_name: str, font_size: int) -> list[str]:
-        """Einfache Wort‑Umbrüche auf max_width."""
-        lines_out: list[str] = []
-        for raw_line in txt.split("
-"):
-            words = raw_line.split(" ")
-            line = ""
-            for w in words:
-                test = (line + (" " if line else "") + w).strip()
-                if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
-                    line = test
-                else:
-                    if line:
-                        lines_out.append(line)
-                    line = w
-            lines_out.append(line)
-        return lines_out
+    story = []
+    story += [Paragraph("ISO 50001 – Heizenergieabschätzung Lüftungsanlagen (v1)", H1), Spacer(1, 6)]
+    story += [Paragraph(f"Erzeugt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1, 8)]
 
-    def line(txt: str, size=10, bold=False, gap=4):
-        nonlocal y
-        font = "Helvetica-Bold" if bold else "Helvetica"
-        c.setFont(font, size)
-        for t in wrap_lines(txt, font, size):
-            c.drawString(x, y, t)
-            y -= (size + gap)
-            if y < 30*mm:
-                c.showPage(); y = H - 20*mm; c.setFont(font, size)
+    story += [
+        Paragraph("1. Zweck & Systemgrenzen", H2),
+        Paragraph(
+            "Lüftungsanlagen ohne direkte Wärmemengen-/Stromzähler. Abschätzung auf Basis TRY-Außenluft (stündlich) "
+            "und Anlagenparametern (Volumenstrom, Soll-Zuluft, Betriebsfenster, WRG, SFP/fan_kW). "
+            "Systemgrenze: Heizbedarf der Zuluft und Ventilatorarbeit.", N),
+        Spacer(1, 6),
+    ]
 
-    line("ISO 50001 – Heizenergieabschätzung Lüftungsanlagen (v1)", 14, True)
-    line(f"Erzeugt: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    story += [
+        Paragraph("2. Datenquelle (TRY)", H2),
+        Paragraph(try_info or "TRY-CSV eingelesen.", N),
+        Spacer(1, 6),
+    ]
 
-    line("1. Zweck & Systemgrenzen", 12, True)
-    line("Lüftungsanlagen ohne direkte Wärmemengen-/Stromzähler. Abschätzung auf Basis TRY-Außenluft (stündlich) und Anlagenparametern (Volumenstrom, Soll-Zuluft, Betriebsfenster, WRG, SFP/fan_kW). Systemgrenze: Heizbedarf der Zuluft und Ventilatorarbeit.")
+    story += [
+        Paragraph("3. Annahmen & Parameter (Defaults)", H2),
+        Paragraph(
+            f"T_normal: {defaults.T_normal_C} °C, "
+            f"T_absenk: {defaults.T_absenk_C} °C, "
+            f"V_absenk: {defaults.V_absenk_m3h if defaults.V_absenk_m3h is not None else '=V_normal'} m³/h.", N),
+        Spacer(1, 6),
+    ]
 
-    line("2. Datenquelle (TRY)", 12, True)
-    line(try_info or "TRY-CSV eingelesen.")
+    story += [
+        Paragraph("4. Methodik (v1)", H2),
+        Paragraph(
+            "Stündlich: ΔT = max(0, T_soll − T_out). Mit WRG: ΔT_eff = (1 − η_t)·ΔT. "
+            "Heizleistung: Q̇ = 0,34·V·ΔT_eff (kW), pro Stunde Q_kWh = Q̇. "
+            "Ventilator: SFP·V/3600 oder fan_kW·(V/V_normal). "
+            "Überlappung minütlich berücksichtigt (z. B. 06:30–17:00). Aggregation je Monat/Jahr.", N),
+        Spacer(1, 6),
+    ]
 
-    line("3. Annahmen & Parameter (Defaults)", 12, True)
-    line(f"T_normal: {defaults.T_normal_C} °C, T_absenk: {defaults.T_absenk_C} °C, V_absenk: {defaults.V_absenk_m3h if defaults.V_absenk_m3h is not None else '=V_normal'} m³/h.")
-
-    line("4. Methodik (v1)", 12, True)
-    line("Stündlich: ΔT = max(0, T_soll − T_out). Mit WRG: ΔT_eff = (1 − η_t)·ΔT. Heizleistung: Q̇ = 0,34·V·ΔT_eff (kW), Pro Stunde Q_kWh = Q̇·h. Ventilator: SFP·V/3600 oder fan_kW·(V/V_normal). Überlappung minütlich berücksichtigt (z. B. 06:30–17:00). Aggregation je Monat/Jahr.")
-
-    line("5. Ergebnisse – Anlage", 12, True)
-    line(f"ID/Name: {plant.id} {plant.name}")
+    # Jahreswerte (gerundet für Lesbarkeit)
     if not yearly.empty:
-        ysum = yearly.iloc[0]
-        line(f"Jahressumme: Wärme {ysum['kWh_th']:.0f} kWh_th, Ventilator {ysum['kWh_el']:.0f} kWh_el, Betriebsstunden {ysum['fan_hours']:.0f} h.")
+        ysum = yearly.iloc[0].copy()
+        ysum["kWh_th"] = round(ysum["kWh_th"], 0)
+        ysum["kWh_el"] = round(ysum["kWh_el"], 0)
+        ysum["fan_hours"] = round(ysum["fan_hours"], 1)
+        story += [Paragraph("5. Ergebnisse – Jahreswerte", H2)]
+        data = [
+            ["Jahr", "kWh_th", "kWh_el", "Betriebsstunden"],
+            [int(ysum["year"]), int(ysum["kWh_th"]), int(ysum["kWh_el"]), f"{ysum['fan_hours']:.1f}"]
+        ]
+        tbl = Table(data, hAlign="LEFT")
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F2F2F2")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+            ("BOTTOMPADDING", (0,0), (-1,0), 6),
+            ("TOPPADDING", (0,0), (-1,0), 6),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ]))
+        story += [tbl, Spacer(1, 8)]
 
-    line("Monate (kWh)", 11, True)
-    for _, r in monthly.iterrows():
-        line(f"{int(r['year'])}-{int(r['month']):02d}  |  th {r['kWh_th']:.0f}  |  el {r['kWh_el']:.0f}  |  h {r['fan_hours']:.0f}", 10)
+    # Monatstabelle (gerundet)
+    if not monthly.empty:
+        m = monthly.copy()
+        m["kWh_th"] = m["kWh_th"].round(0)
+        m["kWh_el"] = m["kWh_el"].round(0)
+        m["fan_hours"] = m["fan_hours"].round(1)
+        data = [["Jahr", "Monat", "kWh_th", "kWh_el", "Betriebsstunden"]]
+        data += m.astype({"year": int, "month": int}).values.tolist()
+        tbl = Table(data, hAlign="LEFT", repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F2F2F2")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ]))
+        story += [Paragraph("6. Ergebnisse – Monate", H2), tbl]
 
-    line("6. Limitierungen & Hinweise", 12, True)
-    line("Vereinfachtes Modell: konstante Luftdichte/c_p (0,34), keine Feuchte-/Bypass‑Logik, Ventilator linear mit Volumenstrom. Genauigkeit abhängig von Parametrierung und Lastprofil.")
+    story += [
+        Spacer(1, 8),
+        Paragraph("7. Limitierungen & Hinweise", H2),
+        Paragraph(
+            "Vereinfachtes Modell: konstante Luftdichte/c_p (Faktor 0,34), keine Feuchte-/Bypass‑Logik, "
+            "Ventilator linear mit Volumenstrom. Genauigkeit abhängig von Parametrierung und Lastprofil.", N),
+    ]
 
-    c.save()
+    doc.build(story)
     buf.seek(0)
     return buf.read()
-
 # ------------------------------
 # Streamlit UI
 # ------------------------------
