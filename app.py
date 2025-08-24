@@ -225,7 +225,8 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
     def wrap_lines(txt: str, font_name: str, font_size: int) -> list[str]:
         """Einfache Wort‑Umbrüche auf max_width."""
         lines_out: list[str] = []
-        for raw_line in txt.split("\n"):
+        for raw_line in txt.split("
+"):
             words = raw_line.split(" ")
             line = ""
             for w in words:
@@ -417,29 +418,48 @@ if st.button("Berechnen", type="primary"):
 
 # 5) Ergebnisse & Exporte
 if monthly_df is not None and yearly_df is not None:
+    # Kopien mit Rundung für Anzeige
+    m_round = monthly_df.copy()
+    y_round = yearly_df.copy()
+    if not m_round.empty:
+        m_round["kWh_th"] = m_round["kWh_th"].round(0)
+        m_round["kWh_el"] = m_round["kWh_el"].round(0)
+        m_round["fan_hours"] = m_round["fan_hours"].round(1)
+    if not y_round.empty:
+        y_round["kWh_th"] = y_round["kWh_th"].round(0)
+        y_round["kWh_el"] = y_round["kWh_el"].round(0)
+        y_round["fan_hours"] = y_round["fan_hours"].round(1)
+
     st.subheader("Ergebnisse – Monate (eine Anlage)")
-    st.dataframe(monthly_df, use_container_width=True)
+    st.dataframe(m_round, use_container_width=True)
 
     st.subheader("Jahressumme (eine Anlage)")
-    st.dataframe(yearly_df, use_container_width=True)
+    st.dataframe(y_round, use_container_width=True)
 
-    # CSV-Export
-    csv_month = monthly_df.to_csv(index=False).encode("utf-8")
-    st.download_button("per_anlage_monat.csv herunterladen", csv_month, file_name="per_anlage_monat.csv", mime="text/csv")
+    cexp1, cexp2, cexp3 = st.columns(3)
 
-    # PDF-Export
+    # Excel-Export (bevorzugt)
+    try:
+      xlsx_bytes = build_excel(Plant(plant_id, plant_name, V_nominal, int(units), has_hrv, float(eta_t), fan_kW, SFP, week_plan), m_round, y_round)
+      cexp1.download_button("Excel (.xlsx) herunterladen", xlsx_bytes, file_name="Heizenergie_Monate_Jahr.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+      st.warning(f"Excel-Export nicht möglich: {e}")
+
+    # CSV-Export (optional)
+    csv_month = m_round.to_csv(index=False).encode("utf-8")
+    cexp2.download_button("CSV (Monate) herunterladen", csv_month, file_name="per_anlage_monat.csv", mime="text/csv")
+
+    # PDF-Export (verbessert)
     if REPORTLAB_OK:
         try:
-            pdf_bytes = build_pdf(try_info, defaults, Plant(plant_id, plant_name, V_nominal, int(units), has_hrv, float(eta_t), fan_kW, SFP, week_plan), monthly_df, yearly_df)
-            st.download_button("ISO50001_Bericht.pdf herunterladen", pdf_bytes, file_name="ISO50001_Heizenergiebericht.pdf", mime="application/pdf")
+            pdf_bytes = build_pdf(try_info, defaults, Plant(plant_id, plant_name, V_nominal, int(units), has_hrv, float(eta_t), fan_kW, SFP, week_plan), m_round, y_round)
+            cexp3.download_button("PDF (ISO 50001) herunterladen", pdf_bytes, file_name="ISO50001_Heizenergiebericht.pdf", mime="application/pdf")
         except Exception as e:
             st.warning(f"PDF konnte nicht erzeugt werden: {e}")
     else:
         st.info("PDF‑Export: Paket 'reportlab' ist nicht installiert. In requirements.txt hinzufügen: reportlab")
 
-# 6) Hinweise zur Methodik
-with st.expander("Methodik & Annahmen (v1)"):
-    st.markdown(
+st.markdown(
         """
         **Rechenweg:**
         - Stunde für Stunde wird geprüft, ob ein Fenster (Normal/Absenk) aktiv ist.
