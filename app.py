@@ -1,5 +1,5 @@
 # app.py – Heizenergie-Rechner Lüftungsanlagen (TRY → Monats/Jahreswerte)
-# Deutsch · robuste TRY-Prüfung · AUS‑Kalender · klare UI · Detail & Überschlag · Summen · PDF/Excel ISO‑tauglich
+# Deutsch · robuste TRY-Prüfung · AUS-Kalender · klare UI · Detail & Überschlag · Summen · PDF/Excel ISO-tauglich
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, time
@@ -11,7 +11,7 @@ import streamlit as st
 import sys
 
 # ---------------- Sidebar: Build-Info ----------------
-APP_VERSION = "2025-08-25_final_CAL_PDF_v2"
+APP_VERSION = "2025-08-25_final_CAL_PDF_v3"
 st.sidebar.caption(f"Build: {APP_VERSION} · Python {sys.version.split()[0]} · Streamlit {st.__version__}")
 if st.sidebar.button("Cache leeren & neu laden"):
     st.cache_data.clear(); st.cache_resource.clear(); st.rerun()
@@ -20,7 +20,7 @@ if st.sidebar.button("Cache leeren & neu laden"):
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm  # WICHTIG: nicht als Variablenname überschreiben
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
     REPORTLAB_OK = True
@@ -52,6 +52,15 @@ def human_hours(delta_hours: float) -> str:
     d = int(h // 24)
     r = h - d*24
     return f"{d} d {r:.0f} h" if d else f"{r:.0f} h"
+
+# PDF: Sonderzeichen sanieren (ersetzt geschütztes Minus/Leerzeichen etc.)
+def _sanitize(text: str) -> str:
+    if text is None: return ""
+    return (text
+            .replace("\u2011", "-")   # non-breaking hyphen
+            .replace("\u00A0", " ")   # non-breaking space
+            .replace("\u202F", " ")   # narrow no-break space
+            )
 
 # ---------------- Datenklassen ----------------
 @dataclass
@@ -134,7 +143,7 @@ def normiere_wochenplan(plan: List[Tagesplan]) -> List[List[tuple]]:
         out[i].sort(key=lambda x: x[0])
     return out
 
-# ---------------- AUS‑Kalender Utils ----------------
+# ---------------- AUS-Kalender Utils ----------------
 def merge_aus_blocks(blocks: List[AusBlock]) -> List[AusBlock]:
     """Sortiert & verschmilzt sich überlappende/nahtlose Blöcke."""
     if not blocks:
@@ -259,12 +268,12 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
         dt = try_df.iloc[i]["datetime"]
         Tout = float(try_df.iloc[i]["T_out_C"])
 
-        # Vorrang: AUS‑Kalender – ganze Stunde aus?
+        # Vorrang: AUS-Kalender – ganze Stunde aus?
         if hour_in_any_block(dt, aus_blocks):
             rows.append({"datetime": dt, "year": dt.year, "month": dt.month,
                          "kWh_th": 0.0, "kWh_el": 0.0, "Betriebsstunden_Vent": 0.0,
                          "Stunden_AUS": 1.0})
-            rec = {"Zeit": dt, "Modus": "AUS‑Kalender", "Anteil [h]": 1.0,
+            rec = {"Zeit": dt, "Modus": "AUS-Kalender", "Anteil [h]": 1.0,
                    "T_out [°C]": round(Tout,1), "T_soll [°C]": None, "ΔT_eff [K]": None,
                    "V [m³/h]": 0, "Wärme [kWh]": 0.0, "P_fan [kW]": 0.0, "Strom [kWh]": 0.0}
             prot_full.append(rec)
@@ -323,8 +332,8 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
 # ---------------- Überschlagsrechnung (Kontrollrechner) ----------------
 def berechne_ueberschlag(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_blocks: List[AusBlock]):
     """
-    Vereinfachung: Monats‑Mittelwert T_out; Zeitfenster/Volumenströme bleiben gleich (nur ΔT wird gemittelt).
-    AUS‑Kalender setzt Stunden auf V=0 (wie Detail).
+    Vereinfachung: Monats-Mittelwert T_out; Zeitfenster/Volumenströme bleiben gleich (nur ΔT wird gemittelt).
+    AUS-Kalender setzt Stunden auf V=0 (wie Detail).
     """
     if try_df is None or try_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -384,7 +393,7 @@ def berechne_ueberschlag(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, a
     jahr = dfh.groupby(["year"], as_index=False)[["kWh_th","kWh_el"]].sum()
     return mon, jahr
 
-# ---------------- Exporte ----------------
+# ---------------- Exporte (Excel/PDF) ----------------
 def xlsx_export(mon: pd.DataFrame, jahr: pd.DataFrame, prot: pd.DataFrame,
                 mon_ue: pd.DataFrame, jahr_ue: pd.DataFrame, aus_blocks: List[AusBlock]) -> bytes:
     out = BytesIO()
@@ -419,15 +428,21 @@ def xlsx_export(mon: pd.DataFrame, jahr: pd.DataFrame, prot: pd.DataFrame,
         if not p.empty:
             p.to_excel(w, index=False, sheet_name="Protokoll (Ausschnitt)")
 
-        # AUS‑Kalender
+        # AUS-Kalender
         aus_list = merge_aus_blocks(aus_blocks)
         if aus_list:
             df_aus = pd.DataFrame([{
                 "Start": b.start, "Ende (exkl.)": b.ende,
                 "Dauer [h]": round(block_duration_hours(b), 1)
             } for b in aus_list])
-            df_aus.to_excel(w, index=False, sheet_name="AUS‑Kalender")
+            df_aus.to_excel(w, index=False, sheet_name="AUS-Kalender")
 
+    return out.getvalue()
+
+def xlsx_single_sheet(df: pd.DataFrame, sheet_name: str = "Daten") -> bytes:
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name=sheet_name)
     return out.getvalue()
 
 def _pdf_header_footer(canvas, doc):
@@ -442,37 +457,44 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
     if not REPORTLAB_OK:
         raise RuntimeError("ReportLab nicht installiert.")
     out = BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    doc = SimpleDocTemplate(out, pagesize=A4,
+                            leftMargin=18*mm, rightMargin=18*mm,
+                            topMargin=18*mm, bottomMargin=18*mm)
     styles = getSampleStyleSheet()
     H1=styles["Heading1"]; H1.fontSize=14
     H2=styles["Heading2"]; H2.fontSize=12
     N=styles["BodyText"]; N.leading=14
     S=ParagraphStyle("small", parent=N, fontSize=9, leading=12, textColor=colors.grey)
 
+    def P(t, style=N):  # Paragraph mit Sanitizer
+        return Paragraph(_sanitize(t), style)
+
     story=[]
-    story+=[Paragraph("ISO 50001 – Heizenergie Lüftungsanlagen (vereinfachtes Verfahren v1)", H1), Spacer(1,6)]
-    story+=[Paragraph(f"Erstellt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1,6)]
-    story+=[Paragraph("Quelle / TRY", H2), Paragraph(info or "TRY‑CSV (stündlich).", N)]
+    story+=[P("ISO 50001 – Heizenergie Lüftungsanlagen (vereinfachtes Verfahren v1)", H1), Spacer(1,6)]
+    story+=[P(f"Erstellt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1,6)]
+    story+=[P("Quelle / TRY", H2), P(info or "TRY-CSV (stündlich).", N)]
 
     # Datenqualität
     if try_hints:
-        story+=[Spacer(1,4), Paragraph("Datenqualität (Import‑Hinweise):", S)]
+        story+=[Spacer(1,4), P("Datenqualität (Import-Hinweise):", S)]
         for h in try_hints:
-            story+=[Paragraph(f"– {h}", S)]
+            story+=[P(f"- {h}", S)]
     story+=[Spacer(1,8)]
 
-    # Annahmen & Parameter als Tabelle
-    story+=[Paragraph("Annahmen & Parameter", H2)]
+    # Annahmen & Parameter als Tabelle (Strings vorher sanieren)
+    story+=[P("Annahmen & Parameter", H2)]
     ann = [
-        ["Soll‑Zuluft NORMAL [°C]", f"{defs.T_normal_C}"],
-        ["Soll‑Zuluft ABSENK [°C]", f"{defs.T_absenk_C}"],
+        ["Soll-Zuluft NORMAL [°C]", f"{defs.T_normal_C}"],
+        ["Soll-Zuluft ABSENK [°C]", f"{defs.T_absenk_C}"],
         ["V NORMAL [m³/h]", f"{defs.V_normal_m3h:,.0f}".replace(",", ".")],
         ["V ABSENK [m³/h]", "wie normal" if defs.V_absenk_m3h is None else f"{defs.V_absenk_m3h:,.0f}".replace(",", ".")],
         ["WRG / η_t [–]", ("ja" if anl.wrg else "nein") + f" / {anl.eta_t}"],
-        ["Ventilator‑Modell", f"{'SFP '+str(anl.SFP_kW_per_m3s)+' kW/(m³/s)' if anl.SFP_kW_per_m3s is not None else 'fan_kW '+str(anl.fan_kW)+' kW'}"],
+        ["Ventilator-Modell", f"{'SFP '+str(anl.SFP_kW_per_m3s)+' kW/(m³/s)' if anl.SFP_kW_per_m3s is not None else 'fan_kW '+str(anl.fan_kW)+' kW'}"],
         ["V_nominal gesamt [m³/h]", f"{(anl.V_nominal_m3h*anl.anzahl):,.0f}".replace(",", ".")],
         ["Anlagenanzahl [–]", f"{anl.anzahl}"]
     ]
+    # Sanitize table text cells
+    ann = [[_sanitize(a), _sanitize(b)] for a,b in ann]
     T = Table([["Parameter","Wert"], *ann], hAlign="LEFT", colWidths=[70*mm, None])
     T.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
@@ -481,9 +503,9 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
     ]))
     story+=[T, Spacer(1,8)]
 
-    # AUS‑Kalender
+    # AUS-Kalender
     aus_list = merge_aus_blocks(aus_blocks)
-    story+=[Paragraph("AUS‑Kalender (Betriebsferien/Wartung)", H2)]
+    story+=[P("AUS-Kalender (Betriebsferien/Wartung)", H2)]
     if aus_list:
         rows = [["Start","Ende (exkl.)","Dauer [h]"]]
         rows += [[b.start.strftime("%d.%m.%Y %H:%M"), b.ende.strftime("%d.%m.%Y %H:%M"), f"{block_duration_hours(b):.1f}"] for b in aus_list]
@@ -495,19 +517,19 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
         ]))
         story += [T2]
     else:
-        story += [Paragraph("Keine AUS‑Blöcke hinterlegt.", N)]
+        story += [P("Keine AUS-Blöcke hinterlegt.", N)]
     story+=[Spacer(1,8)]
 
     # Methodik
-    story+=[Paragraph("Methodik (Rechengang)", H2),
-            Paragraph("Stündlich aktives Zeitfenster (Normal/Absenk/AUS) je Wochentag. "
-                      "AUS‑Kalender hat Vorrang (Komplettabschaltung). "
-                      "Heizfall: ΔT = max(0, T_soll − T_out); mit WRG: ΔT_eff = (1 − η_t)·ΔT. "
-                      "Wärme: Q = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h. "
-                      "Ventilator: P_fan = SFP·(V/3600) oder fan_kW·(V/V_nominal); Energie E = P_fan·Anteil_h. "
-                      "Aggregation zu Monaten/Jahr.", N),
+    story+=[P("Methodik (Rechengang)", H2),
+            P("Stündlich aktives Zeitfenster (Normal/Absenk/AUS) je Wochentag. "
+              "AUS-Kalender hat Vorrang (Komplettabschaltung). "
+              "Heizfall: ΔT = max(0, T_soll − T_out); mit WRG: ΔT_eff = (1 − η_t)·ΔT. "
+              "Wärme: Q = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h. "
+              "Ventilator: P_fan = SFP·(V/3600) oder fan_kW·(V/V_nominal); Energie E = P_fan·Anteil_h. "
+              "Aggregation zu Monaten/Jahr.", N),
             Spacer(1,6),
-            Paragraph("Hinweis: Vereinfachung (konst. Luftdichte/Wärmekapazität), keine Feuchteeinflüsse/Bypass‑Logik.", S),
+            P("Hinweis: Vereinfachung (konst. Luftdichte/Wärmekapazität), keine Feuchteeinflüsse/Bypass-Logik.", S),
             Spacer(1,8)]
 
     # Ergebnisse – Jahr
@@ -516,10 +538,13 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
         for c in ("kWh_th","kWh_el"): j[c]=j[c].round(0)
         if "Betriebsstunden_Vent" in j: j["Betriebsstunden_Vent"]=j["Betriebsstunden_Vent"].round(1)
         if "Stunden_AUS" in j: j["Stunden_AUS"]=j["Stunden_AUS"].round(1)
-        data=[["Jahr","Wärme [kWh]","Strom Vent. [kWh]","Betriebsstd. Vent.","Stunden AUS"], *j.reindex(columns=["year","kWh_th","kWh_el","Betriebsstunden_Vent","Stunden_AUS"]).values.tolist()]
+        data=[["Jahr","Wärme [kWh]","Strom Vent. [kWh]","Betriebsstd. Vent.","Stunden AUS"],
+              *j.reindex(columns=["year","kWh_th","kWh_el","Betriebsstunden_Vent","Stunden_AUS"]).values.tolist()]
         T3=Table(data,hAlign="LEFT")
-        T3.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),("GRID",(0,0),(-1,-1),0.25,colors.grey),("ALIGN",(1,1),(-1,-1),"RIGHT")]))
-        story+=[Paragraph("Ergebnisse – Jahreswerte (Detail)", H2), T3, Spacer(1,8)]
+        T3.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
+                                ("GRID",(0,0),(-1,-1),0.25,colors.grey),
+                                ("ALIGN",(1,1),(-1,-1),"RIGHT")]))
+        story+=[P("Ergebnisse – Jahreswerte (Detail)", H2), T3, Spacer(1,8)]
 
     # Ergebnisse – Monate
     if not mon.empty:
@@ -530,8 +555,10 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
         data=[["Jahr","Monat","Wärme [kWh]","Strom Vent. [kWh]","Betriebsstd. Vent.","Stunden AUS"],
               *m.reindex(columns=["year","month","kWh_th","kWh_el","Betriebsstunden_Vent","Stunden_AUS"]).astype({"year":int,"month":int}).values.tolist()]
         T4=Table(data,hAlign="LEFT", repeatRows=1)
-        T4.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),("GRID",(0,0),(-1,-1),0.25,colors.grey),("ALIGN",(2,1),(-1,-1),"RIGHT")]))
-        story+=[Paragraph("Ergebnisse – Monate (Detail)", H2), T4]
+        T4.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
+                                ("GRID",(0,0),(-1,-1),0.25,colors.grey),
+                                ("ALIGN",(2,1),(-1,-1),"RIGHT")]))
+        story+=[P("Ergebnisse – Monate (Detail)", H2), T4]
 
     doc.build(story, onFirstPage=_pdf_header_footer, onLaterPages=_pdf_header_footer)
     out.seek(0); return out.read()
@@ -555,11 +582,11 @@ for k, v in defaults:
 # --- Infofenster: Methodik & Kontrolle ---
 with st.expander("ℹ️ Erläuterung – Rechenschritte & Formeln", expanded=False):
     st.markdown("""
-**Datenquelle:** TRY‑CSV (stündlich) mit Spalten `datetime` und `T_out_C`.
+**Datenquelle:** TRY-CSV (stündlich) mit Spalten `datetime` und `T_out_C`.
 
 **Zeitlogik (Priorität):**
-1) **AUS‑Kalender** (Betriebsferien/Wartung) → ganze Stunde AUS  
-2) **Tages‑Schalter** „Anlage AUS“ (00:00–24:00)  
+1) **AUS-Kalender** (Betriebsferien/Wartung) → ganze Stunde AUS  
+2) **Tages-Schalter** „Anlage AUS“ (00:00–24:00)  
 3) **Fenster** Normal/Absenk/AUS (pro Zeitraum)
 
 **Heizfall & WRG:** ΔT = max(0, T_soll − T_out) → ΔT_eff = (1 − η_t) · ΔT
@@ -573,7 +600,7 @@ with st.expander("ℹ️ Erläuterung – Rechenschritte & Formeln", expanded=Fa
 
 with st.expander("🧪 Datenprüfung & Qualität", expanded=False):
     st.markdown("""
-- **24:00‑Zeitstempel** → **00:00 + 1 Tag**  
+- **24:00-Zeitstempel** → **00:00 + 1 Tag**  
 - **Duplikate** → zusammengefasst (letzter Wert)  
 - **Jahresraster** → 8760/8784 Stunden  
 - **Fehlende Stunden** → optional linear interpoliert (Checkbox im Upload)
@@ -581,16 +608,16 @@ with st.expander("🧪 Datenprüfung & Qualität", expanded=False):
 
 with st.expander("🔍 Kontrollrechner (Überschlag) – Idee", expanded=False):
     st.markdown("""
-Monats‑Mittel der Außentemperatur ersetzt stündliche Werte. Zeitanteile/Volumenströme bleiben.  
-Abweichung zeigt Einfluss der Stunden‑Variabilität.
+Monats-Mittel der Außentemperatur ersetzt stündliche Werte. Zeitanteile/Volumenströme bleiben.  
+Abweichung zeigt Einfluss der Stunden-Variabilität.
 """)
 
-st.markdown("**Ablauf:** 1) TRY laden → 2) Anlagendaten → 3) Standardwerte & Zeiten → 3b) AUS‑Kalender → 4) Berechnen.")
+st.markdown("**Ablauf:** 1) TRY laden → 2) Anlagendaten → 3) Standardwerte & Zeiten → 3b) AUS-Kalender → 4) Berechnen.")
 
 # ----- 1) TRY laden (FORM) -----
 with st.form("form_try"):
-    st.subheader("1) TRY‑CSV laden")
-    f = st.file_uploader("TRY‑CSV (stündlich: Datum/Zeit + Außentemperatur)", type=["csv"])
+    st.subheader("1) TRY-CSV laden")
+    f = st.file_uploader("TRY-CSV (stündlich: Datum/Zeit + Außentemperatur)", type=["csv"])
     st.session_state["auto_calc"] = st.checkbox("Automatisch nach Upload berechnen", value=st.session_state["auto_calc"])
     st.session_state["interp"] = st.checkbox("Fehlende Stunden automatisch interpolieren", value=st.session_state["interp"])
     ok1 = st.form_submit_button("TRY übernehmen")
@@ -617,7 +644,7 @@ with st.form("form_try"):
 with st.form("form_anlage"):
     st.subheader("2) Anlagendaten")
     c1 = st.columns([1.2,1,1,1])
-    a_id   = c1[0].text_input("Anlagen‑ID", value="A01")
+    a_id   = c1[0].text_input("Anlagen-ID", value="A01")
     a_name = c1[1].text_input("Bezeichnung", value="Zuluft")
     V_nom  = c1[2].number_input("V_nominal je Anlage [m³/h]", value=5000.0, min_value=500.0, max_value=500000.0, step=100.0)
     n_eq   = c1[3].number_input("Anzahl gleicher Anlagen", value=1, min_value=1, max_value=100, step=1)
@@ -641,8 +668,8 @@ with st.form("form_anlage"):
 # ----- 3) Standardwerte & Zeiten (KEIN FORM – Buttons erlaubt) -----
 st.subheader("3) Standardwerte & Betriebs-/Absenkzeiten")
 c = st.columns(4)
-Tn = c[0].number_input("Soll‑Zuluft NORMAL [°C]", value=20.0, step=0.5, key="Tn")
-Ta = c[1].number_input("Soll‑Zuluft ABSENK [°C]", value=17.0, step=0.5, key="Ta")
+Tn = c[0].number_input("Soll-Zuluft NORMAL [°C]", value=20.0, step=0.5, key="Tn")
+Ta = c[1].number_input("Soll-Zuluft ABSENK [°C]", value=17.0, step=0.5, key="Ta")
 Vn = c[2].number_input("Volumenstrom NORMAL [m³/h]", value=5000.0, min_value=500.0, max_value=500000.0, step=100.0, key="Vn")
 Va = c[3].number_input("Volumenstrom ABSENK [m³/h] (0 = wie normal)", value=2000.0, min_value=0.0, max_value=500000.0, step=100.0, key="Va")
 defs = Defaults(float(Tn), float(Ta), float(Vn), (None if Va==0.0 else float(Va)))
@@ -651,8 +678,8 @@ if st.session_state["wochenplan"] is None:
     st.session_state["wochenplan"] = leerer_wochenplan(defs)
 wp: List[Tagesplan] = st.session_state["wochenplan"]
 
-st.caption("Pro Fenster: **Standard** (aus Abschnitt 3), **Eigener Wert**, oder **Anlage AUS (0 m³/h)**. Über‑Mitternacht wird korrekt geteilt. "
-           "Mit **Tages‑Schalter** unten kann ein Tag komplett AUS gesetzt werden.")
+st.caption("Pro Fenster: **Standard** (Abschnitt 3), **Eigener Wert**, oder **Anlage AUS (0 m³/h)**. Über-Mitternacht wird korrekt geteilt. "
+           "Mit **Tages-Schalter** unten kann ein Tag komplett AUS gesetzt werden.")
 
 def render_fenster(tag_index: int, liste: List[Zeitfenster], modus_label: str):
     st.markdown(modus_label)
@@ -705,7 +732,7 @@ def render_fenster(tag_index: int, liste: List[Zeitfenster], modus_label: str):
 for d in range(7):
     st.markdown(f"### {WOCHENTAGE[d]}")
     day = wp[d]
-    day.day_off = st.checkbox("Anlage an diesem Tag **AUS** (00:00–24:00)", key=f"day_off_{d}", value=day.day_off)
+    day.day_off = st.checkbox("Anlage an diesem Tag AUS (00:00–24:00)", key=f"day_off_{d}", value=day.day_off)
     if day.day_off:
         st.info("Dieser Tag ist komplett AUS. Einzelne Fenster werden ignoriert.")
         if st.button(f"Alle Fenster von {WOCHENTAGE[d]} löschen", key=f"clear_day_{d}"):
@@ -714,16 +741,16 @@ for d in range(7):
         render_fenster(d, day.normal, "Normalbetrieb")
         render_fenster(d, day.absenk, "Absenkbetrieb")
 
-# ----- 3b) Betriebsferien / Wartung (AUS‑Kalender) -----
-st.subheader("3b) Betriebsferien / Wartungsblöcke (AUS‑Kalender)")
-with st.expander("AUS‑Blöcke verwalten", expanded=False):
+# ----- 3b) Betriebsferien / Wartung (AUS-Kalender) -----
+st.subheader("3b) Betriebsferien / Wartungsblöcke (AUS-Kalender)")
+with st.expander("AUS-Blöcke verwalten", expanded=False):
     c0 = st.columns(4)
-    start_d = c0[0].date_input("Start‑Datum", value=date.today())
-    start_t = c0[1].time_input("Start‑Uhrzeit", value=time(0,0))
-    end_d   = c0[2].date_input("Ende‑Datum (exkl.)", value=date.today())
-    end_t   = c0[3].time_input("Ende‑Uhrzeit (exkl.)", value=time(0,0))
+    start_d = c0[0].date_input("Start-Datum", value=date.today())
+    start_t = c0[1].time_input("Start-Uhrzeit", value=time(0,0))
+    end_d   = c0[2].date_input("Ende-Datum (exkl.)", value=date.today())
+    end_t   = c0[3].time_input("Ende-Uhrzeit (exkl.)", value=time(0,0))
     c1 = st.columns([1,1,2])
-    if c1[0].button("AUS‑Block hinzufügen"):
+    if c1[0].button("AUS-Block hinzufügen"):
         start_dt = datetime.combine(start_d, start_t)
         end_dt   = datetime.combine(end_d, end_t)
         if end_dt <= start_dt:
@@ -731,9 +758,9 @@ with st.expander("AUS‑Blöcke verwalten", expanded=False):
         else:
             st.session_state["aus_bloecke"].append(AusBlock(start=start_dt, ende=end_dt))
             st.session_state["aus_bloecke"] = merge_aus_blocks(st.session_state["aus_bloecke"])
-            st.success("AUS‑Block hinzugefügt.")
+            st.success("AUS-Block hinzugefügt.")
             st.rerun()
-    if c1[1].button("Alle AUS‑Blöcke löschen"):
+    if c1[1].button("Alle AUS-Blöcke löschen"):
         st.session_state["aus_bloecke"].clear(); st.rerun()
 
     aus_list = merge_aus_blocks(st.session_state["aus_bloecke"])
@@ -745,13 +772,13 @@ with st.expander("AUS‑Blöcke verwalten", expanded=False):
         df_aus = pd.DataFrame(rows)
         st.dataframe(df_aus, use_container_width=True)
         # Einzel-Löschung
-        del_idx = st.number_input("AUS‑Block Nr. löschen (0 = keiner)", min_value=0, max_value=len(aus_list), value=0, step=1)
-        if del_idx and st.button("Ausgewählten AUS‑Block löschen"):
+        del_idx = st.number_input("AUS-Block Nr. löschen (0 = keiner)", min_value=0, max_value=len(aus_list), value=0, step=1)
+        if del_idx and st.button("Ausgewählten AUS-Block löschen"):
             del st.session_state["aus_bloecke"][del_idx-1]
             st.session_state["aus_bloecke"] = merge_aus_blocks(st.session_state["aus_bloecke"])
             st.rerun()
     else:
-        st.caption("Keine AUS‑Blöcke hinterlegt.")
+        st.caption("Keine AUS-Blöcke hinterlegt.")
 
 # ----- 4) Berechnen -----
 def _rechnen():
@@ -830,47 +857,52 @@ if mon is not None and jahr is not None:
         st.caption("Abweichung Überschlag vs. Detail (positiv = Überschlag kleiner).")
         st.dataframe(cmp_out, use_container_width=True)
 
-    # Rechen‑Protokoll
-    st.subheader("Rechen‑Protokoll (Ausschnitt)")
+    # Rechen-Protokoll
+    st.subheader("Rechen-Protokoll (Ausschnitt)")
     if prot is not None and not prot.empty:
         st.dataframe(prot.head(200), use_container_width=True)
-        csv_full = prot_full.to_csv(index=False).encode("utf-8") if prot_full is not None and not prot_full.empty else b""
+        prot_full_xlsx = xlsx_single_sheet(prot_full, "Protokoll") if prot_full is not None and not prot_full.empty else b""
     else:
         st.info("Kein Protokoll verfügbar.")
-        csv_full = b""
+        prot_full_xlsx = b""
 
     # Plausibilitäts-Check (grobe Heuristik)
     if not j_show.empty:
         th = float(j_show["kWh_th"].sum()); el = float(j_show["kWh_el"].sum())
         hints=[]
-        if th <= 0: hints.append("Wärmebedarf = 0 kWh → Prüfe Soll‑Temperaturen und Zeitfenster.")
+        if th <= 0: hints.append("Wärmebedarf = 0 kWh → Prüfe Soll-Temperaturen und Zeitfenster.")
         if th > 10_000_000: hints.append("Sehr hoher Wärmebedarf (>10 GWh) → Prüfe Volumenstrom/Zeiten/Formel.")
-        if el > th*0.5: hints.append("Ventilatorstrom sehr hoch im Verhältnis zur Wärme → SFP/Fan‑Werte prüfen.")
+        if el > th*0.5: hints.append("Ventilatorstrom sehr hoch im Verhältnis zur Wärme → SFP/Fan-Werte prüfen.")
         for h in hints: st.warning(h)
 
-    # Downloads
+    # Downloads (nur Excel/PDF)
     st.subheader("Downloads")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.download_button(
-        "Excel (Detail + Überschlag + Protokoll + AUS‑Kalender)",
+        "Excel – Auswertung (Detail + Überschlag + Protokoll + AUS-Kalender)",
         xlsx_export(m_show, j_show, prot if prot is not None else pd.DataFrame(),
                     mon_u if mon_u is not None else pd.DataFrame(),
                     jahr_u if jahr_u is not None else pd.DataFrame(),
                     st.session_state["aus_bloecke"]),
         file_name="Heizenergie_Auswertung.xlsx"
     )
-    c2.download_button("CSV – Monate (Detail, DE)", m_de.to_csv(index=False).encode("utf-8"),
-                       file_name="Heizenergie_Monate_DE.csv", mime="text/csv")
+    c2.download_button(
+        "Excel – Monate (Detail, DE)",
+        xlsx_single_sheet(m_de, "Monate (Detail, DE)"),
+        file_name="Heizenergie_Monate_DE.xlsx"
+    )
+    if prot_full_xlsx:
+        c3.download_button(
+            "Excel – Protokoll (vollständig)",
+            prot_full_xlsx,
+            file_name="Heizenergie_Protokoll_Stunden.xlsx"
+        )
     if REPORTLAB_OK:
         anl_obj = st.session_state["anlage"]
         if anl_obj is not None:
-            c3.download_button("PDF (ISO 50001 Kurzbericht)",
+            c4.download_button("PDF – ISO 50001 Kurzbericht",
                                pdf_export(st.session_state.get("try_info",""), defs, anl_obj,
                                           m_show, j_show, st.session_state["aus_bloecke"], st.session_state["try_hints"]),
                                file_name="ISO50001_Heizenergiebericht.pdf", mime="application/pdf")
     else:
-        st.info("PDF‑Export nicht verfügbar (ReportLab nicht installiert).")
-
-    if csv_full:
-        st.download_button("CSV – Rechen‑Protokoll (vollständig)", csv_full,
-                           file_name="Heizenergie_Protokoll_Stunden.csv", mime="text/csv")
+        st.info("PDF-Export nicht verfügbar (ReportLab nicht installiert).")
