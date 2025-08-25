@@ -1,5 +1,5 @@
 # app.py – Heizenergie-Rechner Lüftungsanlagen (TRY → Monats/Jahreswerte)
-# Deutsch · robuste TRY-Prüfung · AUS-Kalender · klare UI · Detail & Überschlag · Summen · PDF/Excel ISO-tauglich
+# Deutsch · robuste TRY-Prüfung · AUS-Kalender · 24/7-Default · Kopfwerte→Kalender · Detail & Überschlag · saubere kWh · PDF/Excel
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, time
@@ -11,7 +11,7 @@ import streamlit as st
 import sys
 
 # ---------------- Sidebar: Build-Info ----------------
-APP_VERSION = "2025-08-25_final_CAL_PDF_v3"
+APP_VERSION = "2025-08-25_final_24x7_v1"
 st.sidebar.caption(f"Build: {APP_VERSION} · Python {sys.version.split()[0]} · Streamlit {st.__version__}")
 if st.sidebar.button("Cache leeren & neu laden"):
     st.cache_data.clear(); st.cache_resource.clear(); st.rerun()
@@ -19,7 +19,7 @@ if st.sidebar.button("Cache leeren & neu laden"):
 # ---------------- Optional: PDF ----------------
 try:
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm  # WICHTIG: nicht als Variablenname überschreiben
+    from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
@@ -53,7 +53,7 @@ def human_hours(delta_hours: float) -> str:
     r = h - d*24
     return f"{d} d {r:.0f} h" if d else f"{r:.0f} h"
 
-# PDF: Sonderzeichen sanieren (ersetzt geschütztes Minus/Leerzeichen etc.)
+# PDF: Sonderzeichen sanieren
 def _sanitize(text: str) -> str:
     if text is None: return ""
     return (text
@@ -104,11 +104,12 @@ class AusBlock:
 
 WOCHENTAGE = ["Mo","Di","Mi","Do","Fr","Sa","So"]
 
-def leerer_wochenplan(defs: Defaults) -> List[Tagesplan]:
+# ---- 24/7-Default: alle Tage 00:00–24:00 Normal ----
+def wochenplan_24x7(defs: Defaults) -> List[Tagesplan]:
     plan: List[Tagesplan] = []
     for d in range(7):
-        normal = [Zeitfenster("06:30","17:00", True, defs.T_normal_C, None)] if d < 5 else []
-        absenk = [Zeitfenster("17:00","06:30", True, defs.T_absenk_C, defs.V_absenk_m3h)] if d < 5 else []
+        normal = [Zeitfenster("00:00","24:00", True, defs.T_normal_C, None)]
+        absenk = []  # zunächst leer
         plan.append(Tagesplan(d, normal, absenk, False))
     return plan
 
@@ -145,14 +146,13 @@ def normiere_wochenplan(plan: List[Tagesplan]) -> List[List[tuple]]:
 
 # ---------------- AUS-Kalender Utils ----------------
 def merge_aus_blocks(blocks: List[AusBlock]) -> List[AusBlock]:
-    """Sortiert & verschmilzt sich überlappende/nahtlose Blöcke."""
     if not blocks:
         return []
     bl = sorted(blocks, key=lambda b: b.start)
     merged = [bl[0]]
     for b in bl[1:]:
         last = merged[-1]
-        if b.start <= last.ende:  # überlappt/berührt
+        if b.start <= last.ende:
             last.ende = max(last.ende, b.ende)
         else:
             merged.append(AusBlock(start=b.start, ende=b.ende))
@@ -162,7 +162,6 @@ def block_duration_hours(block: AusBlock) -> float:
     return (block.ende - block.start).total_seconds() / 3600.0
 
 def hour_in_any_block(start_hour: datetime, blocks: List[AusBlock]) -> bool:
-    """Prüft Überschneidung der Stunde [t, t+1h) mit einem Block [s, e)."""
     end_hour = start_hour + timedelta(hours=1)
     for b in blocks:
         if start_hour < b.ende and end_hour > b.start:
@@ -171,13 +170,6 @@ def hour_in_any_block(start_hour: datetime, blocks: List[AusBlock]) -> bool:
 
 # ---------------- TRY-CSV Parser (robust) ----------------
 def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.DataFrame, list, list]:
-    """
-    Liefert df[datetime,T_out_C], Jahre[], Hinweise[].
-    - 24:00 → 00:00 + 1 Tag (vor GroupBy!)
-    - GroupBy(datetime).last() (echte Dubletten zusammenfassen)
-    - Reindex je Jahr auf Jan-01 00:00 … Dec-31 23:00 (8760/8784)
-    - Optionale Interpolation fehlender Stunden
-    """
     def _find(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
         low = {c.lower().strip(): c for c in df.columns}
         for a in candidates:
@@ -195,7 +187,6 @@ def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.Data
 
     df = raw[[dt_col, t_col]].copy()
 
-    # Temperatur -> float
     if df[t_col].dtype == object:
         df[t_col] = (df[t_col].astype(str)
                                .str.replace(",", ".", regex=False)
@@ -204,7 +195,6 @@ def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.Data
     df[t_col] = pd.to_numeric(df[t_col], errors="coerce")
     df = df.rename(columns={t_col: "T_out_C"})
 
-    # 24:00 sauber -> 00:00 + 1 Tag
     def _fix_24h(s: str):
         s = str(s).strip().replace(" ", "T")
         has_24 = ("T24:" in s) or s.endswith("24:00")
@@ -217,7 +207,6 @@ def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.Data
     df["datetime"] = raw[dt_col].astype(str).apply(_fix_24h)
     df = df[["datetime","T_out_C"]].dropna().sort_values("datetime")
 
-    # Dubletten zusammenfassen (nach 24:00-Korrektur!)
     before = len(df)
     df = df.groupby("datetime", as_index=False)["T_out_C"].last()
     dups = before - len(df)
@@ -225,7 +214,6 @@ def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.Data
     years = sorted(df["datetime"].dt.year.unique().tolist())
     hints = []
 
-    # Für jedes Jahr eigenes volles Stundenraster (Jan-01 00:00 bis Dec-31 23:00)
     parts = []
     missing_total = 0
     for y in years:
@@ -239,16 +227,11 @@ def parse_try_csv(raw: pd.DataFrame, interpolate_missing: bool) -> Tuple[pd.Data
             s = s.interpolate(limit_direction="both")
         parts.append(s.reset_index().rename(columns={"index":"datetime", 0:"T_out_C"}))
 
-    if parts:
-        out = pd.concat(parts, ignore_index=True)
-    else:
-        out = pd.DataFrame(columns=["datetime","T_out_C"])
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["datetime","T_out_C"])
 
     if missing_total > 0:
-        if interpolate_missing:
-            hints.append(f"{missing_total} fehlende Stunde(n) wurden interpoliert.")
-        else:
-            hints.append(f"{missing_total} fehlende Stunde(n) – Quelle prüfen (oder Interpolation aktivieren).")
+        hints.append(f"{missing_total} fehlende Stunde(n) wurden interpoliert." if interpolate_missing
+                     else f"{missing_total} fehlende Stunde(n) – Quelle prüfen (oder Interpolation aktivieren).")
     if dups > 0:
         hints.append(f"{dups} doppelte Zeitstempel zusammengefasst.")
 
@@ -268,7 +251,6 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
         dt = try_df.iloc[i]["datetime"]
         Tout = float(try_df.iloc[i]["T_out_C"])
 
-        # Vorrang: AUS-Kalender – ganze Stunde aus?
         if hour_in_any_block(dt, aus_blocks):
             rows.append({"datetime": dt, "year": dt.year, "month": dt.month,
                          "kWh_th": 0.0, "kWh_el": 0.0, "Betriebsstunden_Vent": 0.0,
@@ -290,18 +272,15 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
             if ol <= 0: continue
             anteil = ol/60.0
 
-            # Volumenstrom
             if V_ovr is not None:
                 V = max(0.0, float(V_ovr))
             else:
                 V = V_norm_total if modus=="Normal" else (V_norm_total if defs.V_absenk_m3h is None else float(defs.V_absenk_m3h))
 
-            # Heizenergie (kWh)
             dT = max(0.0, float(T_soll) - Tout)
             dT_eff = (1.0 - clamp(float(anlage.eta_t),0.0,1.0))*dT if anlage.wrg else dT
             Q_kWh = 0.00034 * V * dT_eff * anteil
 
-            # Ventilator
             P_kW = 0.0
             if V > 0:
                 if anlage.SFP_kW_per_m3s is not None:
@@ -316,7 +295,7 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
             rec = {"Zeit":dt,"Modus":modus,"Anteil [h]":round(anteil,3),
                    "T_out [°C]":round(Tout,1),"T_soll [°C]":round(T_soll,1) if V>0 else None,
                    "ΔT_eff [K]":round(dT_eff,2) if V>0 else None,"V [m³/h]":round(V,0),
-                   "Wärme [kWh]":round(Q_kWh,6),"P_fan [kW]":round(P_kW,4),"Strom [kWh]":round(E_kWh,6)}
+                   "Wärme [kWh]":round(Q_kWh,3),"P_fan [kW]":round(P_kW,2),"Strom [kWh]":round(E_kWh,3)}
             prot_full.append(rec)
             if len(prot) < 500: prot.append(rec)
 
@@ -329,17 +308,12 @@ def berechne_detail(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_bl
     jahr = dfh.groupby(["year"], as_index=False)[["kWh_th","kWh_el","Betriebsstunden_Vent","Stunden_AUS"]].sum()
     return mon, jahr, pd.DataFrame(prot), pd.DataFrame(prot_full)
 
-# ---------------- Überschlagsrechnung (Kontrollrechner) ----------------
+# ---------------- Überschlagsrechnung ----------------
 def berechne_ueberschlag(try_df: pd.DataFrame, anlage: Anlage, defs: Defaults, aus_blocks: List[AusBlock]):
-    """
-    Vereinfachung: Monats-Mittelwert T_out; Zeitfenster/Volumenströme bleiben gleich (nur ΔT wird gemittelt).
-    AUS-Kalender setzt Stunden auf V=0 (wie Detail).
-    """
     if try_df is None or try_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     aus_blocks = merge_aus_blocks(aus_blocks)
 
-    # Monatsmittel T_out
     df = try_df.copy()
     df["year"] = df["datetime"].dt.year
     df["month"] = df["datetime"].dt.month
@@ -408,6 +382,11 @@ def xlsx_export(mon: pd.DataFrame, jahr: pd.DataFrame, prot: pd.DataFrame,
         for col in ("kWh_th","kWh_el"):
             if col in mu: mu[col] = mu[col].round(0)
             if col in ju: ju[col] = ju[col].round(0)
+        if not p.empty:
+            # Protokoll angenehmer runden
+            for c in ("Wärme [kWh]","Strom [kWh]"):
+                if c in p: p[c] = p[c].astype(float).round(3)
+            if "P_fan [kW]" in p: p["P_fan [kW]"] = p["P_fan [kW]"].astype(float).round(2)
 
         m_de = m.rename(columns={"year":"Jahr","month":"Monat","kWh_th":"Wärme [kWh]","kWh_el":"Strom Vent. [kWh]",
                                  "Betriebsstunden_Vent":"Betriebsstd. Vent.","Stunden_AUS":"Stunden AUS"})
@@ -416,10 +395,10 @@ def xlsx_export(mon: pd.DataFrame, jahr: pd.DataFrame, prot: pd.DataFrame,
         mu_de = mu.rename(columns={"year":"Jahr","month":"Monat","kWh_th":"Wärme [kWh]","kWh_el":"Strom Vent. [kWh]"})
         ju_de = ju.rename(columns={"year":"Jahr","kWh_th":"Wärme [kWh]","kWh_el":"Strom Vent. [kWh]"})
 
+        # Summenzeile: nur bei MONATEN
         m_de = add_sum_row(m_de, label_col="Monat", label="Summe")
-        j_de = add_sum_row(j_de)
         mu_de = add_sum_row(mu_de, label_col="Monat", label="Summe")
-        ju_de = add_sum_row(ju_de)
+        # Keine Summenzeile bei Jahres-Tabellen (j_de, ju_de)
 
         m_de.to_excel(w, index=False, sheet_name="Monate (Detail)")
         j_de.to_excel(w, index=False, sheet_name="Jahr (Detail)")
@@ -474,14 +453,12 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
     story+=[P(f"Erstellt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1,6)]
     story+=[P("Quelle / TRY", H2), P(info or "TRY-CSV (stündlich).", N)]
 
-    # Datenqualität
     if try_hints:
         story+=[Spacer(1,4), P("Datenqualität (Import-Hinweise):", S)]
         for h in try_hints:
             story+=[P(f"- {h}", S)]
     story+=[Spacer(1,8)]
 
-    # Annahmen & Parameter als Tabelle (Strings vorher sanieren)
     story+=[P("Annahmen & Parameter", H2)]
     ann = [
         ["Soll-Zuluft NORMAL [°C]", f"{defs.T_normal_C}"],
@@ -493,7 +470,6 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
         ["V_nominal gesamt [m³/h]", f"{(anl.V_nominal_m3h*anl.anzahl):,.0f}".replace(",", ".")],
         ["Anlagenanzahl [–]", f"{anl.anzahl}"]
     ]
-    # Sanitize table text cells
     ann = [[_sanitize(a), _sanitize(b)] for a,b in ann]
     T = Table([["Parameter","Wert"], *ann], hAlign="LEFT", colWidths=[70*mm, None])
     T.setStyle(TableStyle([
@@ -503,7 +479,6 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
     ]))
     story+=[T, Spacer(1,8)]
 
-    # AUS-Kalender
     aus_list = merge_aus_blocks(aus_blocks)
     story+=[P("AUS-Kalender (Betriebsferien/Wartung)", H2)]
     if aus_list:
@@ -520,19 +495,17 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
         story += [P("Keine AUS-Blöcke hinterlegt.", N)]
     story+=[Spacer(1,8)]
 
-    # Methodik
     story+=[P("Methodik (Rechengang)", H2),
             P("Stündlich aktives Zeitfenster (Normal/Absenk/AUS) je Wochentag. "
               "AUS-Kalender hat Vorrang (Komplettabschaltung). "
               "Heizfall: ΔT = max(0, T_soll − T_out); mit WRG: ΔT_eff = (1 − η_t)·ΔT. "
               "Wärme: Q = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h. "
-              "Ventilator: P_fan = SFP·(V/3600) oder fan_kW·(V/V_nominal); Energie E = P_fan·Anteil_h. "
+              "Ventilator: P_fan = SFP·(V/3600) oder fan_kW·(V/V_nominal); Energie E = P_fan · Anteil_h. "
               "Aggregation zu Monaten/Jahr.", N),
             Spacer(1,6),
             P("Hinweis: Vereinfachung (konst. Luftdichte/Wärmekapazität), keine Feuchteeinflüsse/Bypass-Logik.", S),
             Spacer(1,8)]
 
-    # Ergebnisse – Jahr
     if not jahr.empty:
         j = jahr.copy()
         for c in ("kWh_th","kWh_el"): j[c]=j[c].round(0)
@@ -546,7 +519,6 @@ def pdf_export(info: str, defs: Defaults, anl: Anlage,
                                 ("ALIGN",(1,1),(-1,-1),"RIGHT")]))
         story+=[P("Ergebnisse – Jahreswerte (Detail)", H2), T3, Spacer(1,8)]
 
-    # Ergebnisse – Monate
     if not mon.empty:
         m = mon.copy()
         for c in ("kWh_th","kWh_el"): m[c]=m[c].round(0)
@@ -579,42 +551,20 @@ defaults = [
 for k, v in defaults:
     if k not in st.session_state: st.session_state[k] = v
 
-# --- Infofenster: Methodik & Kontrolle ---
+# --- Infofenster ---
 with st.expander("ℹ️ Erläuterung – Rechenschritte & Formeln", expanded=False):
     st.markdown("""
-**Datenquelle:** TRY-CSV (stündlich) mit Spalten `datetime` und `T_out_C`.
-
 **Zeitlogik (Priorität):**
 1) **AUS-Kalender** (Betriebsferien/Wartung) → ganze Stunde AUS  
 2) **Tages-Schalter** „Anlage AUS“ (00:00–24:00)  
 3) **Fenster** Normal/Absenk/AUS (pro Zeitraum)
 
-**Heizfall & WRG:** ΔT = max(0, T_soll − T_out) → ΔT_eff = (1 − η_t) · ΔT
-
-**Wärme je Stunde:** Q = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h
-
+**Heizfall & WRG:** ΔT = max(0, T_soll − T_out) → ΔT_eff = (1 − η_t) · ΔT  
+**Wärme je Stunde:** Q = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h  
 **Ventilator:** P_fan = SFP · (V/3600) **oder** fan_kW · (V/V_nominal) → E = P_fan · Anteil_h
-
-**Aggregation:** Summen je Monat/Jahr; Kennzahl **Stunden AUS**.
 """)
 
-with st.expander("🧪 Datenprüfung & Qualität", expanded=False):
-    st.markdown("""
-- **24:00-Zeitstempel** → **00:00 + 1 Tag**  
-- **Duplikate** → zusammengefasst (letzter Wert)  
-- **Jahresraster** → 8760/8784 Stunden  
-- **Fehlende Stunden** → optional linear interpoliert (Checkbox im Upload)
-""")
-
-with st.expander("🔍 Kontrollrechner (Überschlag) – Idee", expanded=False):
-    st.markdown("""
-Monats-Mittel der Außentemperatur ersetzt stündliche Werte. Zeitanteile/Volumenströme bleiben.  
-Abweichung zeigt Einfluss der Stunden-Variabilität.
-""")
-
-st.markdown("**Ablauf:** 1) TRY laden → 2) Anlagendaten → 3) Standardwerte & Zeiten → 3b) AUS-Kalender → 4) Berechnen.")
-
-# ----- 1) TRY laden (FORM) -----
+# ----- 1) TRY laden -----
 with st.form("form_try"):
     st.subheader("1) TRY-CSV laden")
     f = st.file_uploader("TRY-CSV (stündlich: Datum/Zeit + Außentemperatur)", type=["csv"])
@@ -640,7 +590,7 @@ with st.form("form_try"):
                 if st.session_state["auto_calc"]:
                     st.session_state["trigger"] = True
 
-# ----- 2) Anlagendaten (FORM) -----
+# ----- 2) Anlagendaten -----
 with st.form("form_anlage"):
     st.subheader("2) Anlagendaten")
     c1 = st.columns([1.2,1,1,1])
@@ -665,7 +615,7 @@ with st.form("form_anlage"):
                                             st.session_state["wochenplan"] or [])
         st.success("Anlagendaten übernommen.")
 
-# ----- 3) Standardwerte & Zeiten (KEIN FORM – Buttons erlaubt) -----
+# ----- 3) Standardwerte & Zeiten -----
 st.subheader("3) Standardwerte & Betriebs-/Absenkzeiten")
 c = st.columns(4)
 Tn = c[0].number_input("Soll-Zuluft NORMAL [°C]", value=20.0, step=0.5, key="Tn")
@@ -674,32 +624,39 @@ Vn = c[2].number_input("Volumenstrom NORMAL [m³/h]", value=5000.0, min_value=50
 Va = c[3].number_input("Volumenstrom ABSENK [m³/h] (0 = wie normal)", value=2000.0, min_value=0.0, max_value=500000.0, step=100.0, key="Va")
 defs = Defaults(float(Tn), float(Ta), float(Vn), (None if Va==0.0 else float(Va)))
 
+# Wochenplan initialisieren (24/7 Default) und Schaltfläche zum Übernehmen der Kopfwerte
 if st.session_state["wochenplan"] is None:
-    st.session_state["wochenplan"] = leerer_wochenplan(defs)
+    st.session_state["wochenplan"] = wochenplan_24x7(defs)
+
+if st.button("Kopfwerte in Kalender übernehmen (24/7 Normal für alle Tage)"):
+    st.session_state["wochenplan"] = wochenplan_24x7(defs)
+    st.success("Kalender aktualisiert (24/7 Normalbetrieb mit aktuellen Kopfwerten).")
+
 wp: List[Tagesplan] = st.session_state["wochenplan"]
 
-st.caption("Pro Fenster: **Standard** (Abschnitt 3), **Eigener Wert**, oder **Anlage AUS (0 m³/h)**. Über-Mitternacht wird korrekt geteilt. "
-           "Mit **Tages-Schalter** unten kann ein Tag komplett AUS gesetzt werden.")
+st.caption("Voreinstellung: **24/7 Normalbetrieb** auf allen Tagen. "
+           "Fenster können ergänzt werden (Absenk/AUS). Über-Mitternacht wird korrekt geteilt. "
+           "Tages-Schalter setzt einen Tag komplett AUS.")
 
 def render_fenster(tag_index: int, liste: List[Zeitfenster], modus_label: str):
     st.markdown(modus_label)
     add_key = f"add_{modus_label}_{tag_index}"
     if st.button(f"+ Fenster {modus_label} {WOCHENTAGE[tag_index]}", key=add_key):
-        if "Normal" in modus_label:
-            liste.append(Zeitfenster("08:00","16:00", True, defs.T_normal_C, None))
-        else:
+        # Absenk-Defaults nutzen, wenn Absenk; sonst Normal
+        if "Absenk" in modus_label:
             liste.append(Zeitfenster("17:00","06:30", True, defs.T_absenk_C, defs.V_absenk_m3h))
+        else:
+            liste.append(Zeitfenster("08:00","16:00", True, defs.T_normal_C, None))
         st.rerun()
 
     delete_index = None
     for i, f in enumerate(liste):
-        cols = st.columns([1,1,1,1,1,1,0.6])  # Start|Ende|Fenster verwenden|T_soll|Auswahl|(Wert)|Löschen
+        cols = st.columns([1,1,1,1,1,1,0.6])  # Start|Ende|Aktiv|T_soll|Vol-Mode|(Wert)|Löschen
         f.start = cols[0].text_input("Start", key=f"{modus_label}_start_{tag_index}_{i}", value=f.start)
         f.ende  = cols[1].text_input("Ende",  key=f"{modus_label}_ende_{tag_index}_{i}", value=f.ende)
         f.aktiv = cols[2].checkbox("Fenster verwenden", key=f"{modus_label}_aktiv_{tag_index}_{i}", value=f.aktiv)
         f.T_soll_C = cols[3].number_input("T_soll [°C]", key=f"{modus_label}_Tsoll_{tag_index}_{i}", value=float(f.T_soll_C), step=0.5)
 
-        # Volumenstrom-Optionen
         if f.V_m3h is None:
             default_mode = "Standard (Abschnitt 3)"
         elif f.V_m3h == 0.0:
@@ -728,7 +685,7 @@ def render_fenster(tag_index: int, liste: List[Zeitfenster], modus_label: str):
     if delete_index is not None:
         liste.pop(delete_index); st.rerun()
 
-# --- Tagweise Editor mit „Anlage AUS“ ---
+# --- Tagweise Editor + Tages-AUS ---
 for d in range(7):
     st.markdown(f"### {WOCHENTAGE[d]}")
     day = wp[d]
@@ -741,7 +698,7 @@ for d in range(7):
         render_fenster(d, day.normal, "Normalbetrieb")
         render_fenster(d, day.absenk, "Absenkbetrieb")
 
-# ----- 3b) Betriebsferien / Wartung (AUS-Kalender) -----
+# ----- 3b) AUS-Kalender -----
 st.subheader("3b) Betriebsferien / Wartungsblöcke (AUS-Kalender)")
 with st.expander("AUS-Blöcke verwalten", expanded=False):
     c0 = st.columns(4)
@@ -758,25 +715,21 @@ with st.expander("AUS-Blöcke verwalten", expanded=False):
         else:
             st.session_state["aus_bloecke"].append(AusBlock(start=start_dt, ende=end_dt))
             st.session_state["aus_bloecke"] = merge_aus_blocks(st.session_state["aus_bloecke"])
-            st.success("AUS-Block hinzugefügt.")
-            st.rerun()
+            st.success("AUS-Block hinzugefügt."); st.rerun()
     if c1[1].button("Alle AUS-Blöcke löschen"):
         st.session_state["aus_bloecke"].clear(); st.rerun()
 
     aus_list = merge_aus_blocks(st.session_state["aus_bloecke"])
     if aus_list:
-        # Einträge anzeigen + löschen
         rows = []
         for idx, b in enumerate(aus_list):
             rows.append({"#": idx+1, "Start": b.start, "Ende (exkl.)": b.ende, "Dauer [h]": round(block_duration_hours(b),1)})
         df_aus = pd.DataFrame(rows)
         st.dataframe(df_aus, use_container_width=True)
-        # Einzel-Löschung
         del_idx = st.number_input("AUS-Block Nr. löschen (0 = keiner)", min_value=0, max_value=len(aus_list), value=0, step=1)
         if del_idx and st.button("Ausgewählten AUS-Block löschen"):
             del st.session_state["aus_bloecke"][del_idx-1]
-            st.session_state["aus_bloecke"] = merge_aus_blocks(st.session_state["aus_bloecke"])
-            st.rerun()
+            st.session_state["aus_bloecke"] = merge_aus_blocks(st.session_state["aus_bloecke"]); st.rerun()
     else:
         st.caption("Keine AUS-Blöcke hinterlegt.")
 
@@ -798,21 +751,20 @@ if cols_run[0].button("Berechnen", type="primary"): _rechnen()
 if st.session_state["trigger"]:
     _rechnen(); st.session_state["trigger"] = False
 
-# ----- Ergebnisse sichtbar + Downloads darunter -----
+# ----- Ergebnisse + Downloads -----
 mon = st.session_state["mon_df"]; jahr = st.session_state["jahr_df"]
 prot = st.session_state["prot_df"]; prot_full = st.session_state["prot_full_df"]
 mon_u = st.session_state["mon_ue_df"]; jahr_u = st.session_state["jahr_ue_df"]
 
 if mon is not None and jahr is not None:
-    # Anzeige runden und Spalten DE benennen
+    # Anzeige runden (kWh ganzzahlig; Stunden 1 Dezimal)
     m_show = mon.copy(); j_show = jahr.copy()
     for c in ("kWh_th","kWh_el"):
         if c in m_show: m_show[c] = m_show[c].round(0)
         if c in j_show: j_show[c] = j_show[c].round(0)
-    if "Betriebsstunden_Vent" in m_show: m_show["Betriebsstunden_Vent"] = m_show["Betriebsstunden_Vent"].round(1)
-    if "Betriebsstunden_Vent" in j_show: j_show["Betriebsstunden_Vent"] = j_show["Betriebsstunden_Vent"].round(1)
-    if "Stunden_AUS" in m_show: m_show["Stunden_AUS"] = m_show["Stunden_AUS"].round(1)
-    if "Stunden_AUS" in j_show: j_show["Stunden_AUS"] = j_show["Stunden_AUS"].round(1)
+    for c in ("Betriebsstunden_Vent","Stunden_AUS"):
+        if c in m_show: m_show[c] = m_show[c].round(1)
+        if c in j_show: j_show[c] = j_show[c].round(1)
 
     m_de = m_show.rename(columns={
         "year":"Jahr", "month":"Monat",
@@ -825,9 +777,8 @@ if mon is not None and jahr is not None:
         "Betriebsstunden_Vent":"Betriebsstd. Vent.","Stunden_AUS":"Stunden AUS"
     })
 
-    # Summenzeilen
+    # Summenzeile nur bei Monaten
     m_de = add_sum_row(m_de, label_col="Monat", label="Summe")
-    j_de = add_sum_row(j_de)
 
     st.subheader("Ergebnisse – Jahreswerte (Detail)")
     st.dataframe(j_de, use_container_width=True)
@@ -835,7 +786,7 @@ if mon is not None and jahr is not None:
     st.subheader("Ergebnisse – Monate (Detail)")
     st.dataframe(m_de, use_container_width=True)
 
-    # Überschlag & Vergleich
+    # Überschlag
     if mon_u is not None and not mon_u.empty:
         mu = mon_u.copy(); ju = jahr_u.copy()
         mu[["kWh_th","kWh_el"]] = mu[["kWh_th","kWh_el"]].round(0)
@@ -843,8 +794,7 @@ if mon is not None and jahr is not None:
 
         mu_de = mu.rename(columns={"year":"Jahr","month":"Monat","kWh_th":"Wärme [kWh]","kWh_el":"Strom Vent. [kWh]"})
         ju_de = ju.rename(columns={"year":"Jahr","kWh_th":"Wärme [kWh]","kWh_el":"Strom Vent. [kWh]"})
-        mu_de = add_sum_row(mu_de, label_col="Monat", label="Summe")
-        ju_de = add_sum_row(ju_de)
+        mu_de = add_sum_row(mu_de, label_col="Monat", label="Summe")  # nur bei Monaten
 
         st.subheader("Kontrollrechner – Monate (Überschlag)")
         st.dataframe(mu_de, use_container_width=True)
@@ -857,7 +807,7 @@ if mon is not None and jahr is not None:
         st.caption("Abweichung Überschlag vs. Detail (positiv = Überschlag kleiner).")
         st.dataframe(cmp_out, use_container_width=True)
 
-    # Rechen-Protokoll
+    # Rechen-Protokoll (Ausschnitt)
     st.subheader("Rechen-Protokoll (Ausschnitt)")
     if prot is not None and not prot.empty:
         st.dataframe(prot.head(200), use_container_width=True)
@@ -866,16 +816,16 @@ if mon is not None and jahr is not None:
         st.info("Kein Protokoll verfügbar.")
         prot_full_xlsx = b""
 
-    # Plausibilitäts-Check (grobe Heuristik)
+    # Plausibilitäts-Checks (grobe Heuristik)
     if not j_show.empty:
         th = float(j_show["kWh_th"].sum()); el = float(j_show["kWh_el"].sum())
         hints=[]
-        if th <= 0: hints.append("Wärmebedarf = 0 kWh → Prüfe Soll-Temperaturen und Zeitfenster.")
-        if th > 10_000_000: hints.append("Sehr hoher Wärmebedarf (>10 GWh) → Prüfe Volumenstrom/Zeiten/Formel.")
-        if el > th*0.5: hints.append("Ventilatorstrom sehr hoch im Verhältnis zur Wärme → SFP/Fan-Werte prüfen.")
+        if th < 0: hints.append("Wärmebedarf < 0 kWh – Eingaben prüfen.")
+        if el < 0: hints.append("Strom < 0 kWh – Eingaben prüfen.")
+        if el > th*0.5 and th > 0: hints.append("Ventilatorstrom sehr hoch im Verhältnis zur Wärme → SFP/Fan-Werte prüfen.")
         for h in hints: st.warning(h)
 
-    # Downloads (nur Excel/PDF)
+    # Downloads (Excel/PDF)
     st.subheader("Downloads")
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button(
