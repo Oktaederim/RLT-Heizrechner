@@ -1,6 +1,6 @@
 # app.py
-# Heizenergieabschätzung Lüftungsanlagen (TRY → Monats/Jahreswerte), ISO 50001-tauglich
-# Robust: Session-State, sicherer CSV-Import, Validierungen, XLSX/PDF-Exporte
+# Heizenergie-Rechner Lüftungsanlagen (TRY → Monats/Jahreswerte), ISO 50001-tauglich
+# Deutsch, robuste Importe, klare UI, nachvollziehbare Rechnung, Excel & PDF
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-# Optional: PDF-Erzeugung (Platypus)
+# Optional: PDF
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -20,7 +20,6 @@ try:
     REPORTLAB_OK = True
 except Exception:
     REPORTLAB_OK = False
-
 
 # =========================
 # Hilfsfunktionen
@@ -42,185 +41,248 @@ def overlap_minutes(a0: int, a1: int, b0: int, b1: int) -> int:
 def clamp(x: float, a: float, b: float) -> float:
     return max(a, min(b, x))
 
-
 # =========================
 # Datenklassen
 # =========================
 @dataclass
-class Window:
-    start: str
-    end: str
-    mode: str   # "Normal" | "Absenk"
-    T_override_C: Optional[float] = None
-    V_override_m3h: Optional[float] = None
+class Zeitfenster:
+    start: str        # "HH:MM"
+    ende: str         # "HH:MM"
+    aktiv: bool       # an/aus
+    T_soll_C: float   # Soll-Zulufttemperatur
+    V_m3h: Optional[float] = None  # None = Standard (Normal/Absenk)
 
 @dataclass
-class DayPlan:
-    day: int  # 0=Mo..6=So
-    windows: List[Window]
+class Tagesplan:
+    tag: int                 # 0=Mo..6=So
+    normal: List[Zeitfenster]
+    absenk: List[Zeitfenster]
 
 @dataclass
 class Defaults:
     T_normal_C: float = 20.0
     T_absenk_C: float = 17.0
-    V_absenk_m3h: Optional[float] = 2000.0  # None => wie V_normal
+    V_normal_m3h: float = 5000.0     # Standard, wenn kein Override im Fenster
+    V_absenk_m3h: Optional[float] = 2000.0  # None = wie normal
 
 @dataclass
-class Plant:
+class Anlage:
     id: str
     name: str
     V_nominal_m3h: float
-    units_count: int
-    has_HRV: bool
-    eta_t: float
-    fan_power_kW: Optional[float]
+    anzahl: int
+    wrg: bool
+    eta_t: float               # 0..1 (Wärmerückgewinnung)
+    fan_kW: Optional[float]    # Gesamtleistung bei V_nominal
     SFP_kW_per_m3s: Optional[float]
-    plan: List[DayPlan]
-    notes: str = ""
+    wochenplan: List[Tagesplan]
+    notizen: str = ""
 
+WOCHENTAGE = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
-# =========================
-# Wochenplan
-# =========================
-DAYS = ["Mo","Di","Mi","Do","Fr","Sa","So"]
-
-def empty_week_plan() -> List[DayPlan]:
-    week: List[DayPlan] = []
+def leerer_wochenplan(defaults: Defaults) -> List[Tagesplan]:
+    plan: List[Tagesplan] = []
     for d in range(7):
-        wins: List[Window] = []
-        if d < 5:
-            wins.append(Window("06:30","17:00","Normal"))
-            wins.append(Window("17:00","06:30","Absenk"))
-        # Sa/So standardmäßig aus (keine Fenster)
-        week.append(DayPlan(day=d, windows=wins))
-    return week
+        normal = [Zeitfenster("06:30", "17:00", True, defaults.T_normal_C, None)] if d < 5 else []
+        absenk = [Zeitfenster("17:00", "06:30", True, defaults.T_absenk_C, defaults.V_absenk_m3h)] if d < 5 else []
+        plan.append(Tagesplan(tag=d, normal=normal, absenk=absenk))
+    return plan
 
-def normalize_week(plan: List[DayPlan]) -> List[List[Tuple[int,int,Window]]]:
-    norm: List[List[Tuple[int,int,Window]]] = [[] for _ in range(7)]
+def normiere_wochenplan(plan: List[Tagesplan]) -> List[List[Tuple[int,int,str,float,Optional[float]]]]:
+    """
+    Liefert je Tag eine Liste (startMin, endMin, modus, T_soll, V_override)
+    modus = "Normal" | "Absenk"
+    Über-Mitternacht wird gesplittet
+    """
+    norm: List[List[Tuple[int,int,str,float,Optional[float]]]] = [[] for _ in range(7)]
+    def add(tag:int, f:Zeitfenster, modus:str):
+        if not f.aktiv: return
+        s = minutes(f.start); e = minutes(f.ende)
+        if s == e: return
+        if e > s:
+            norm[tag].append((s, e, modus, float(f.T_soll_C), None if f.V_m3h is None else float(f.V_m3h)))
+        else:
+            norm[tag].append((s, 1440, modus, float(f.T_soll_C), None if f.V_m3h is None else float(f.V_m3h)))
+            norm[(tag+1)%7].append((0, e, modus, float(f.T_soll_C), None if f.V_m3h is None else float(f.V_m3h)))
     for d in plan:
-        for w in d.windows:
-            s = minutes(w.start); e = minutes(w.end)
-            if s == e:  # 0-Länge ignorieren
-                continue
-            if e > s:
-                norm[d.day].append((s,e,w))
-            else:
-                norm[d.day].append((s,1440,w))
-                norm[(d.day+1)%7].append((0,e,w))
-    for i in range(7): norm[i].sort(key=lambda t: t[0])
+        for f in d.normal: add(d.tag, f, "Normal")
+        for f in d.absenk: add(d.tag, f, "Absenk")
+    for i in range(7): norm[i].sort(key=lambda x: x[0])
     return norm
 
+# =========================
+# robuste TRY-CSV Verarbeitung
+# =========================
+def parse_try_csv(raw: pd.DataFrame) -> Tuple[pd.DataFrame, list, list]:
+    """Erkennt Spalten, behandelt 24:00, reindiziert auf stündliches Raster, liefert df[datetime,T_out_C]."""
+    def _find_column(df: pd.DataFrame, aliases: list[str]) -> Optional[str]:
+        low = {c.lower().strip(): c for c in df.columns}
+        for a in aliases:
+            if a in low: return low[a]
+        for c in df.columns:
+            cl = c.lower().strip()
+            if any(a in cl for a in aliases): return c
+        return None
+
+    dt_aliases = ["datetime","date_time","date/time","date","timestamp","zeit","zeitstempel","datestamp","datetime_local","datetime_utc"]
+    t_aliases  = ["t_out_c","t_out","tout","temp_out","temperature_out","aussen","außen","ta","t2m","t_out(°c)"]
+
+    dt_col = _find_column(raw, dt_aliases) or st.selectbox("Datums-/Zeitspalte wählen", raw.columns)
+    t_col  = _find_column(raw, t_aliases)  or st.selectbox("Außentemperatur-Spalte wählen", raw.columns)
+
+    df = raw[[dt_col, t_col]].copy()
+    # Temperatur zu float (Komma/°C zulassen)
+    if df[t_col].dtype == object:
+        df[t_col] = (df[t_col].astype(str)
+                                 .str.replace(",", ".", regex=False)
+                                 .str.replace("°C", "", regex=False)
+                                 .str.strip())
+    df[t_col] = pd.to_numeric(df[t_col], errors="coerce")
+    df = df.rename(columns={t_col: "T_out_C"})
+
+    # 24:00 → 00:00 + 1 Tag
+    def _fix_24h(s: str):
+        s = str(s).strip().replace(" ", "T")
+        had_24 = ("T24:" in s) or s.endswith("24:00")
+        s2 = s.replace("T24:", "T00:").replace(" 24:", " 00:")
+        dt = pd.to_datetime(s2, errors="coerce")
+        if had_24 and pd.notna(dt):
+            dt = dt + pd.Timedelta(days=1)
+        return dt
+
+    df["datetime"] = raw[dt_col].astype(str).apply(_fix_24h)
+    df = df[["datetime","T_out_C"]].dropna().sort_values("datetime")
+
+    # Doppelte Zeitstempel – letzten Wert pro Zeit behalten
+    df = df.groupby("datetime", as_index=False)["T_out_C"].last()
+
+    # Reindex auf stündliches Raster
+    problems = []
+    if not df.empty:
+        start = df["datetime"].min().replace(minute=0, second=0, microsecond=0)
+        end   = df["datetime"].max().replace(minute=0, second=0, microsecond=0)
+        full_index = pd.date_range(start, end, freq="H")
+        s = df.set_index("datetime")["T_out_C"].reindex(full_index)
+        missing = int(s.isna().sum())
+        if missing > 0:
+            problems.append(f"{missing} fehlende Stunde(n) – Quelle prüfen.")
+            # Optional: Interpolation aktivieren
+            # s = s.interpolate(limit_direction="both")
+        df = s.reset_index().rename(columns={"index":"datetime", 0:"T_out_C"})
+    years = sorted(df["datetime"].dt.year.unique().tolist()) if not df.empty else []
+    return df, years, problems
 
 # =========================
-# Kernberechnung
+# Berechnung
 # =========================
-def compute(try_df: pd.DataFrame, plant: Plant, defaults: Defaults):
-    V_nom_total = float(plant.V_nominal_m3h) * int(plant.units_count)
-    V_nom_total = float(clamp(V_nom_total, 0.0, 500000.0))
-    norm = normalize_week(plant.plan)
+def berechne(try_df: pd.DataFrame, anlage: Anlage, defaults: Defaults):
+    """Monats-/Jahres-Summen + optionales Stundenprotokoll (für Nachvollziehbarkeit)."""
+    V_normal_total = float(anlage.V_nominal_m3h) * int(anlage.anzahl)
+    V_normal_total = float(clamp(V_normal_total, 0.0, 500000.0))
 
+    norm = normiere_wochenplan(anlage.wochenplan)
+
+    protokoll = []  # für Transparenz
     rec = []
+
     for i in range(len(try_df)):
         dt0 = try_df.iloc[i]["datetime"]
         Tout = float(try_df.iloc[i]["T_out_C"])
-        day_js = dt0.weekday()
+        tag = dt0.weekday()
         m0 = dt0.hour * 60 + dt0.minute
         m1 = m0 + 60
 
-        for (s,e,w) in norm[day_js]:
-            ol = overlap_minutes(m0,m1,s,e)
-            if ol <= 0: continue
-            frac_h = ol/60.0
+        # alle Fenster des Tages durchgehen
+        stunden_Q_kWh = 0.0
+        stunden_E_kWh = 0.0
+        stunden_h_vent = 0.0
 
-            T_soll = float(w.T_override_C) if w.T_override_C is not None else (defaults.T_normal_C if w.mode=="Normal" else defaults.T_absenk_C)
-            if w.V_override_m3h is not None:
-                V_m3h = max(0.0, float(w.V_override_m3h))
+        for (s, e, modus, T_soll, V_override) in norm[tag]:
+            ol = overlap_minutes(m0, m1, s, e)
+            if ol <= 0: 
+                continue
+            anteil_h = ol / 60.0
+
+            # Setpoints
+            if V_override is not None:
+                V_m3h = max(0.0, float(V_override))
             else:
-                V_m3h = V_nom_total if w.mode=="Normal" else (V_nom_total if defaults.V_absenk_m3h is None else float(defaults.V_absenk_m3h))
+                V_m3h = V_normal_total if modus == "Normal" else (V_normal_total if defaults.V_absenk_m3h is None else float(defaults.V_absenk_m3h))
 
-            dT = max(0.0, T_soll - Tout)
-            dT_eff = (1.0 - clamp(float(plant.eta_t),0.0,1.0))*dT if plant.has_HRV else dT
-            Qdot_kW = 0.34 * V_m3h * dT_eff
-            Q_kWh = Qdot_kW * frac_h
+            # Wärmebedarf – nur bei Heizfall
+            dT = max(0.0, float(T_soll) - Tout)
+            dT_eff = (1.0 - clamp(float(anlage.eta_t), 0.0, 1.0)) * dT if anlage.wrg else dT
 
+            # **KORREKT:** kWh für den Minutenanteil
+            Q_kWh = 0.00034 * V_m3h * dT_eff * anteil_h
+
+            # Ventilator
             P_fan_kW = 0.0
-            if V_m3h > 0.0:
-                if plant.SFP_kW_per_m3s is not None:
-                    P_fan_kW = float(plant.SFP_kW_per_m3s) * (V_m3h/3600.0)
-                elif plant.fan_power_kW is not None:
-                    ref = max(1.0, V_nom_total)
-                    factor = clamp(V_m3h/ref, 0.0, 1.0)  # v1 linear
-                    P_fan_kW = float(plant.fan_power_kW) * factor
+            if V_m3h > 0:
+                if anlage.SFP_kW_per_m3s is not None:
+                    P_fan_kW = float(anlage.SFP_kW_per_m3s) * (V_m3h / 3600.0)
+                elif anlage.fan_kW is not None:
+                    # v1 linear mit Volumenstrom
+                    ref = max(1.0, V_normal_total)
+                    P_fan_kW = float(anlage.fan_kW) * clamp(V_m3h / ref, 0.0, 1.0)
+            E_kWh = P_fan_kW * anteil_h
 
-            E_kWh = P_fan_kW * frac_h
+            stunden_Q_kWh += Q_kWh
+            stunden_E_kWh += E_kWh
+            stunden_h_vent += anteil_h if V_m3h > 0 else 0.0
 
-            rec.append({
-                "datetime": dt0,
-                "year": dt0.year,
-                "month": dt0.month,
-                "kWh_th": Q_kWh,
-                "kWh_el": E_kWh,
-                "fan_hours": frac_h if V_m3h > 0 else 0.0,
+            # Protokolleintrag (nur erste N für Anzeige)
+            protokoll.append({
+                "Zeit": dt0,
+                "Modus": modus,
+                "Anteil_h": round(anteil_h, 3),
+                "T_out": round(Tout, 1),
+                "T_soll": float(T_soll),
+                "ΔT_eff": round(dT_eff, 2),
+                "V_m3h": round(V_m3h, 0),
+                "Q_kWh": round(Q_kWh, 4),
+                "P_fan_kW": round(P_fan_kW, 3),
+                "E_kWh": round(E_kWh, 4)
             })
 
-    df = pd.DataFrame.from_records(rec)
-    monthly = df.groupby(["year","month"], as_index=False)[["kWh_th","kWh_el","fan_hours"]].sum()
-    yearly  = df.groupby(["year"], as_index=False)[["kWh_th","kWh_el","fan_hours"]].sum()
-    return monthly, yearly
+        rec.append({
+            "datetime": dt0,
+            "year": dt0.year,
+            "month": dt0.month,
+            "kWh_th": stunden_Q_kWh,
+            "kWh_el": stunden_E_kWh,
+            "Betriebsstunden_Vent": stunden_h_vent,
+        })
 
+    dfh = pd.DataFrame.from_records(rec)
+    monat = dfh.groupby(["year","month"], as_index=False)[["kWh_th","kWh_el","Betriebsstunden_Vent"]].sum()
+    jahr  = dfh.groupby(["year"], as_index=False)[["kWh_th","kWh_el","Betriebsstunden_Vent"]].sum()
+    return monat, jahr, pd.DataFrame(protokoll)
 
 # =========================
-# Excel-Exporte
+# Exporte
 # =========================
-def build_excel(plant: Plant, monthly: pd.DataFrame, yearly: pd.DataFrame) -> bytes:
+def build_excel(monat: pd.DataFrame, jahr: pd.DataFrame, protokoll: pd.DataFrame) -> bytes:
     out = BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        m = monthly.copy(); y = yearly.copy()
+        m = monat.copy(); j = jahr.copy(); p = protokoll.copy()
+        # Rundungen für Lesbarkeit
         for col in ("kWh_th","kWh_el"):
             if col in m: m[col] = m[col].round(0)
-            if col in y: y[col] = y[col].round(0)
-        if "fan_hours" in m: m["fan_hours"] = m["fan_hours"].round(1)
-        if "fan_hours" in y: y["fan_hours"] = y["fan_hours"].round(1)
+            if col in j: j[col] = j[col].round(0)
+        if "Betriebsstunden_Vent" in m: m["Betriebsstunden_Vent"] = m["Betriebsstunden_Vent"].round(1)
+        if "Betriebsstunden_Vent" in j: j["Betriebsstunden_Vent"] = j["Betriebsstunden_Vent"].round(1)
+        if not p.empty:
+            p["Q_kWh"] = p["Q_kWh"].round(4)
+            p["E_kWh"] = p["E_kWh"].round(4)
 
         m.to_excel(writer, index=False, sheet_name="Monate")
-        y.to_excel(writer, index=False, sheet_name="Jahreswerte")
+        j.to_excel(writer, index=False, sheet_name="Jahr")
+        p.to_excel(writer, index=False, sheet_name="Protokoll")
 
-        wb = writer.book
-        fmt_int  = wb.add_format({"num_format": "#,##0"})
-        fmt_1dec = wb.add_format({"num_format": "#,##0.0"})
-        fmt_hdr  = wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1})
-
-        for sh, df in (("Monate", m), ("Jahreswerte", y)):
-            ws = writer.sheets[sh]
-            ws.set_row(0, 20, fmt_hdr)
-            headers = list(df.columns)
-            for i, col in enumerate(headers):
-                if col in ("kWh_th","kWh_el"):
-                    ws.set_column(i, i, 14, fmt_int)
-                elif col == "fan_hours":
-                    ws.set_column(i, i, 14, fmt_1dec)
-                else:
-                    ws.set_column(i, i, 12)
-            ws.autofilter(0, 0, len(df), len(headers)-1)
-            ws.freeze_panes(1, 0)
     return out.getvalue()
 
-def build_excel_months(monthly: pd.DataFrame) -> bytes:
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        m = monthly.copy()
-        if not m.empty:
-            m["kWh_th"] = m["kWh_th"].round(0)
-            m["kWh_el"] = m["kWh_el"].round(0)
-            m["fan_hours"] = m["fan_hours"].round(1)
-        m.to_excel(writer, index=False, sheet_name="Monate")
-    return out.getvalue()
-
-
-# =========================
-# PDF-Export (Platypus)
-# =========================
-def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataFrame, yearly: pd.DataFrame) -> bytes:
+def build_pdf(info: str, defaults: Defaults, anlage: Anlage, monat: pd.DataFrame, jahr: pd.DataFrame) -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("ReportLab ist nicht installiert.")
     buf = BytesIO()
@@ -231,28 +293,28 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
     N  = styles["BodyText"]; N.leading = 14
 
     story = []
-    story += [Paragraph("ISO 50001 – Heizenergieabschätzung Lüftungsanlagen (v1)", H1), Spacer(1, 6)]
-    story += [Paragraph(f"Erzeugt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1, 8)]
+    story += [Paragraph("ISO 50001 – Heizenergie Lüftungsanlagen (v1, vereinfachtes Verfahren)", H1), Spacer(1, 6)]
+    story += [Paragraph(f"Erstellt: {datetime.now():%d.%m.%Y %H:%M}", N), Spacer(1, 8)]
+    story += [Paragraph("Quelle / TRY", H2), Paragraph(info or "TRY-CSV eingelesen (stündlich).", N), Spacer(1, 6)]
+    story += [Paragraph("Annahmen & Parameter", H2),
+              Paragraph(f"T_normal: {defaults.T_normal_C} °C; T_absenk: {defaults.T_absenk_C} °C; V_normal: {defaults.V_normal_m3h} m³/h; "
+                        f"V_absenk: {defaults.V_absenk_m3h if defaults.V_absenk_m3h is not None else 'wie normal'} m³/h. "
+                        f"WRG: {'ja' if anlage.wrg else 'nein'} (η_t={anlage.eta_t}). "
+                        f"Ventilator: {'SFP='+str(anlage.SFP_kW_per_m3s)+' kW/(m³/s)' if anlage.SFP_kW_per_m3s is not None else 'fan_kW='+str(anlage.fan_kW)+' kW'}.", N),
+              Spacer(1, 6)]
+    story += [Paragraph("Methodik", H2),
+              Paragraph("Für jede Stunde wird das aktive Zeitfenster (Normal/Absenk) ermittelt. "
+                        "Heizfall: ΔT = max(0, T_soll − T_out); mit WRG: ΔT_eff = (1 − η_t)·ΔT. "
+                        "Wärme je Stunde: Q_kWh = 0,00034 · V(m³/h) · ΔT_eff · Anteil_h. "
+                        "Ventilator: P_fan = SFP·(V/3600) oder fan_kW·(V/V_nominal), Energie E_kWh = P_fan·Anteil_h. "
+                        "Aggregation zu Monat/Jahr.", N),
+              Spacer(1, 6)]
 
-    story += [Paragraph("1. Zweck & Systemgrenzen", H2),
-              Paragraph("Lüftungsanlagen ohne direkte Wärmemengen-/Stromzähler. Abschätzung auf Basis TRY-Außenluft (stündlich) und Anlagenparametern (Volumenstrom, Soll-Zuluft, Betriebsfenster, WRG, SFP/fan_kW). Systemgrenze: Heizbedarf der Zuluft und Ventilatorarbeit.", N),
-              Spacer(1, 6)]
-    story += [Paragraph("2. Datenquelle (TRY)", H2), Paragraph(try_info or "TRY-CSV eingelesen.", N), Spacer(1, 6)]
-    story += [Paragraph("3. Annahmen & Parameter (Defaults)", H2),
-              Paragraph(f"T_normal: {defaults.T_normal_C} °C, T_absenk: {defaults.T_absenk_C} °C, V_absenk: {defaults.V_absenk_m3h if defaults.V_absenk_m3h is not None else '=V_normal'} m³/h.", N),
-              Spacer(1, 6)]
-    story += [Paragraph("4. Methodik (v1)", H2),
-              Paragraph("Stündlich: ΔT = max(0, T_soll − T_out). Mit WRG: ΔT_eff = (1 − η_t)·ΔT. Heizleistung: Q̇ = 0,34·V·ΔT_eff (kW), pro Stunde Q_kWh = Q̇. Ventilator: SFP·V/3600 oder fan_kW·(V/V_normal). Überlappung minütlich berücksichtigt (z. B. 06:30–17:00). Aggregation je Monat/Jahr.", N),
-              Spacer(1, 6)]
-
-    if not yearly.empty:
-        ysum = yearly.iloc[0].copy()
-        ysum["kWh_th"] = round(ysum["kWh_th"], 0)
-        ysum["kWh_el"] = round(ysum["kWh_el"], 0)
-        ysum["fan_hours"] = round(ysum["fan_hours"], 1)
-        story += [Paragraph("5. Ergebnisse – Jahreswerte", H2)]
-        data = [["Jahr","kWh_th","kWh_el","Betriebsstunden"],
-                [int(ysum["year"]), int(ysum["kWh_th"]), int(ysum["kWh_el"]), f"{ysum['fan_hours']:.1f}"]]
+    if not jahr.empty:
+        j = jahr.copy()
+        j[["kWh_th","kWh_el"]] = j[["kWh_th","kWh_el"]].round(0)
+        j["Betriebsstunden_Vent"] = j["Betriebsstunden_Vent"].round(1)
+        data = [["Jahr","kWh_th","kWh_el","Betriebsstunden Vent."], *j.values.tolist()]
         tbl = Table(data, hAlign="LEFT")
         tbl.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
@@ -260,14 +322,13 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
             ("ALIGN",(1,1),(-1,-1),"RIGHT"),
             ("GRID",(0,0),(-1,-1),0.25,colors.grey),
         ]))
-        story += [tbl, Spacer(1, 8)]
+        story += [Paragraph("Ergebnisse – Jahreswerte", H2), tbl, Spacer(1, 6)]
 
-    if not monthly.empty:
-        m = monthly.copy()
-        m["kWh_th"] = m["kWh_th"].round(0)
-        m["kWh_el"] = m["kWh_el"].round(0)
-        m["fan_hours"] = m["fan_hours"].round(1)
-        data = [["Jahr","Monat","kWh_th","kWh_el","Betriebsstunden"], *m.astype({"year":int,"month":int}).values.tolist()]
+    if not monat.empty:
+        m = monat.copy()
+        m[["kWh_th","kWh_el"]] = m[["kWh_th","kWh_el"]].round(0)
+        m["Betriebsstunden_Vent"] = m["Betriebsstunden_Vent"].round(1)
+        data = [["Jahr","Monat","kWh_th","kWh_el","Betriebsstunden Vent."], *m.astype({"year":int,"month":int}).values.tolist()]
         tbl = Table(data, hAlign="LEFT", repeatRows=1)
         tbl.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F2F2F2")),
@@ -275,225 +336,207 @@ def build_pdf(try_info: str, defaults: Defaults, plant: Plant, monthly: pd.DataF
             ("ALIGN",(2,1),(-1,-1),"RIGHT"),
             ("GRID",(0,0),(-1,-1),0.25,colors.grey),
         ]))
-        story += [Paragraph("6. Ergebnisse – Monate", H2), tbl]
-
-    story += [Spacer(1, 8), Paragraph("7. Limitierungen & Hinweise", H2),
-              Paragraph("Vereinfachtes Modell: konstante Luftdichte/c_p (Faktor 0,34), keine Feuchte-/Bypass‑Logik, Ventilator linear mit Volumenstrom. Genauigkeit abhängig von Parametrierung und Lastprofil.", N)]
+        story += [Paragraph("Ergebnisse – Monate", H2), tbl]
 
     doc.build(story); buf.seek(0); return buf.read()
-
 
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="Heizenergie – ISO 50001", layout="wide")
+st.set_page_config(page_title="Heizenergie – Lüftungsanlagen (ISO 50001)", layout="wide")
 st.title("Heizenergie – Lüftungsanlagen (ISO 50001)")
 
-# Session: Daten & Ergebnisse
-for k, v in [("try_df", None), ("try_info",""), ("monthly_df", None), ("yearly_df", None)]:
-    if k not in st.session_state: st.session_state[k] = v
+# Session initialisieren
+for k, v in [
+    ("try_df", None), ("try_info",""),
+    ("monat_df", None), ("jahr_df", None),
+    ("protokoll_df", None),
+    ("auto_calc", False), ("trigger_recalc", False),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-st.markdown("**Ziel:** Monats-/Jahreswerte (kWh_th, kWh_el) aus TRY‑CSV und Anlagenparametern. CSV: `datetime` (ISO), `T_out_C` (°C).")
+st.markdown("**Ziel:** Monats-/Jahreswerte (kWh Wärme / kWh elektrisch) aus TRY‑CSV und Anlagenparametern. "
+            "Die Tabellen werden **zuerst angezeigt**, **darunter** gibt es die Download‑Links.")
 
 # ---------- 1) TRY-CSV laden (robust) ----------
 with st.expander("1) TRY‑CSV laden", expanded=True):
-    f = st.file_uploader("TRY‑CSV auswählen (stündlich, Datum/Zeit + Außentemperatur)", type=["csv"])
-
-    def _find_column(df: pd.DataFrame, aliases: list[str]) -> Optional[str]:
-        low = {c.lower().strip(): c for c in df.columns}
-        for a in aliases:
-            if a in low: return low[a]
-        for c in df.columns:
-            cl = c.lower().strip()
-            if any(a in cl for a in aliases):
-                return c
-        return None
+    f = st.file_uploader("TRY‑CSV (stündlich: Datum/Zeit + Außentemperatur)", type=["csv"])
+    st.session_state["auto_calc"] = st.checkbox("Automatisch nach Upload berechnen", value=st.session_state["auto_calc"])
 
     if f is not None:
         raw = pd.read_csv(f)
-
-        dt_aliases = ["datetime","date_time","date/time","date","timestamp","zeit","zeitstempel","datestamp","datetime_local","datetime_utc"]
-        t_aliases  = ["t_out_c","t_out","tout","temp_out","temperature_out","aussen","außen","ta","t2m","t_out(°c)"]
-
-        dt_col = _find_column(raw, dt_aliases)
-        t_col  = _find_column(raw, t_aliases)
-
-        c1, c2 = st.columns(2)
-        dt_col = c1.selectbox("Datums-/Zeitspalte", options=["— bitte wählen —"]+raw.columns.tolist(),
-                              index=(raw.columns.tolist().index(dt_col)+1 if dt_col in raw.columns else 0))
-        t_col  = c2.selectbox("Außentemperatur-Spalte", options=["— bitte wählen —"]+raw.columns.tolist(),
-                              index=(raw.columns.tolist().index(t_col)+1 if t_col in raw.columns else 0))
-
-        if dt_col == "— bitte wählen —" or t_col == "— bitte wählen —":
-            st.info("Bitte beide Spalten auswählen.")
+        df, years, problems = parse_try_csv(raw)
+        if df.empty:
+            st.error("Kein gültiger Datensatz (prüfe Spalten & Format).")
         else:
-            df = raw[[dt_col, t_col]].copy()
-
-            # Temp zu float (Komma zulassen)
-            if df[t_col].dtype == object:
-                df[t_col] = (df[t_col].astype(str)
-                                       .str.replace(",", ".", regex=False)
-                                       .str.replace("°C", "", regex=False)
-                                       .str.strip())
-            df[t_col] = pd.to_numeric(df[t_col], errors="coerce")
-
-            # Datum/Zeit
-            df["datetime"] = df[dt_col].astype(str).apply(parse_datetime)
-            df = df.rename(columns={t_col: "T_out_C"})
-            df = df[["datetime","T_out_C"]].dropna().sort_values("datetime").reset_index(drop=True)
-
-            # --- Validierungen ---
-            problems = []
-
-            # Dubletten
-            dup = df["datetime"].duplicated().sum()
-            if dup > 0:
-                problems.append(f"{dup} doppelte Zeitstempel entfernt")
-                df = df[~df["datetime"].duplicated(keep="first")]
-
-            # Lücken prüfen (grobe Heuristik)
-            if len(df) >= 2:
-                diffs = df["datetime"].diff().dropna()
-                # Anteil 1h-Schritte
-                one_h = (diffs == pd.Timedelta(hours=1)).mean()
-                if one_h < 0.95:
-                    problems.append("Unregelmäßiges Raster (weniger als 95 % 1‑Stunden‑Schritte).")
-
-            # Jahreslänge (Info)
-            years = sorted(df["datetime"].dt.year.unique().tolist())
             tmin, tmax = df["T_out_C"].min(), df["T_out_C"].max()
-
-            st.session_state["try_df"] = df
-            st.session_state["try_info"] = f"Datensätze: {len(df)} | Jahre: {', '.join(map(str, years))} | T_out: {tmin}…{tmax} °C"
+            st.session_state["try_df"]  = df
+            st.session_state["try_info"] = f"Datensätze: {len(df)} | Jahre: {', '.join(map(str, years))} | T_out: {round(tmin,1)}…{round(tmax,1)} °C"
             st.success("TRY‑CSV eingelesen.")
             st.text(st.session_state["try_info"])
             if problems:
                 st.warning(" / ".join(problems))
+            if st.session_state["auto_calc"]:
+                st.session_state["trigger_recalc"] = True
     else:
         if st.session_state["try_df"] is not None:
             st.info("TRY‑CSV bereits geladen.")
             if st.session_state["try_info"]:
                 st.text(st.session_state["try_info"])
 
-# ---------- 2) Defaults ----------
-with st.expander("2) Defaults – Normal/Absenk", expanded=True):
-    c = st.columns(3)
-    T_normal = c[0].number_input("T_normal [°C]", value=20.0, step=0.5)
-    T_absenk = c[1].number_input("T_absenk [°C]", value=17.0, step=0.5)
-    V_absenk = c[2].number_input("V_absenk [m³/h] (leer = wie normal)", value=2000.0, min_value=0.0, max_value=500000.0, step=100.0)
-    defaults = Defaults(T_normal_C=float(T_normal), T_absenk_C=float(T_absenk), V_absenk_m3h=float(V_absenk))
-    st.caption("Hinweis: V_absenk = 0 ⇒ Ventilator AUS im Absenk‑Fenster. None (=wie normal) ist v2‑Option.")
+# ---------- 2) Standard‑Parameter ----------
+with st.expander("2) Standard‑Parameter (Temperaturen, Volumenströme)", expanded=True):
+    c = st.columns(4)
+    T_normal = c[0].number_input("Soll-Zuluft NORMAL [°C]", value=20.0, step=0.5)
+    T_absenk = c[1].number_input("Soll-Zuluft ABSENK [°C]", value=17.0, step=0.5)
+    V_normal = c[2].number_input("Volumenstrom NORMAL [m³/h]", value=5000.0, min_value=500.0, max_value=500000.0, step=100.0)
+    V_absenk = c[3].number_input("Volumenstrom ABSENK [m³/h] (leer=wie normal)", value=2000.0, min_value=0.0, max_value=500000.0, step=100.0)
+    defaults = Defaults(T_normal_C=float(T_normal), T_absenk_C=float(T_absenk), V_normal_m3h=float(V_normal), V_absenk_m3h=float(V_absenk))
 
-# ---------- 3) Anlage ----------
-with st.expander("3) Anlage", expanded=True):
+# ---------- 3) Anlage & Betrieb ----------
+with st.expander("3) Anlage & Betrieb / Absenkzeiten", expanded=True):
     r1 = st.columns([1.2,1,1,1])
-    plant_id   = r1[0].text_input("ID", value="A01")
-    plant_name = r1[1].text_input("Name", value="Zuluft – Beispiel")
-    V_nominal  = r1[2].number_input("V_nominal [m³/h] (Einzelanlage)", value=5000.0, min_value=500.0, max_value=500000.0, step=100.0)
-    units      = r1[3].number_input("Anzahl gleicher Anlagen", value=1, min_value=1, max_value=100, step=1)
+    anlage_id   = r1[0].text_input("Anlagen-ID", value="A01")
+    anlage_name = r1[1].text_input("Bezeichnung", value="Zuluft Beispiel")
+    V_nominal   = r1[2].number_input("V_nominal (Einzelanlage) [m³/h]", value=V_normal, min_value=500.0, max_value=500000.0, step=100.0)
+    anzahl      = r1[3].number_input("Anzahl gleicher Anlagen", value=1, min_value=1, max_value=100, step=1)
 
     r2 = st.columns(3)
-    has_hrv = r2[0].checkbox("WRG vorhanden", value=True)
-    eta_t   = r2[1].number_input("η_t (0–1)", value=0.7, min_value=0.0, max_value=1.0, step=0.05)
-    vent_model = r2[2].selectbox("Ventilator-Modell", ("SFP","fan_kW"), index=1)
+    wrg    = r2[0].checkbox("WRG vorhanden", value=True)
+    eta_t  = r2[1].number_input("η_t WRG (0–1)", value=0.7, min_value=0.0, max_value=1.0, step=0.05)
+    vent_m = r2[2].selectbox("Ventilator-Modell", ("SFP (kW/(m³/s))","fan_kW gesamt"), index=1)
 
     fan_kW = None; SFP = None
-    if vent_model == "SFP":
+    if vent_m.startswith("SFP"):
         SFP = st.number_input("SFP [kW/(m³/s)]", value=1.8, min_value=0.0, max_value=10.0, step=0.1)
     else:
-        fan_kW = st.number_input("fan_kW (bei V_nominal gesamt)", value=5.0, min_value=0.0, max_value=1000.0, step=0.1)
+        fan_kW = st.number_input("fan_kW (bei V_nominal, gesamt)", value=5.0, min_value=0.0, max_value=1000.0, step=0.1)
 
-    # Wochenplan-Editor (einfach): je Tag Fensterliste
-    if "week_plan" not in st.session_state:
-        st.session_state["week_plan"] = empty_week_plan()
-    wp: List[DayPlan] = st.session_state["week_plan"]
+    # Wochenplan – einfache, übersichtliche Eingabe:
+    if "wochenplan" not in st.session_state:
+        st.session_state["wochenplan"] = leerer_wochenplan(defaults)
+    wp: List[Tagesplan] = st.session_state["wochenplan"]
 
-    st.markdown("**Betrieb & Absenkung (minütliche Zeitfenster, Über‑Mitternacht erlaubt)**")
+    st.caption("Für jeden Tag können mehrere Normal- oder Absenk-Fenster definiert werden. "
+               "Über‑Mitternacht (z. B. 17:00–06:30) ist erlaubt.")
     for d in range(7):
-        st.write(f"**{DAYS[d]}**")
+        st.write(f"**{WOCHENTAGE[d]}**")
         day = wp[d]
-        # vorhandene Fenster
-        to_del = None
-        for w_idx, w in enumerate(list(day.windows)):
-            cols = st.columns([1,1,1,1,1,0.5])
-            w.start = cols[0].text_input("Start", key=f"start_{d}_{w_idx}", value=w.start)
-            w.end   = cols[1].text_input("Ende", key=f"end_{d}_{w_idx}", value=w.end)
-            w.mode  = cols[2].selectbox("Modus", ["Normal","Absenk"], key=f"mode_{d}_{w_idx}", index=(0 if w.mode=="Normal" else 1))
-            # Konsistenter float-Input
-            tval = float(w.T_override_C) if w.T_override_C is not None else 0.0
-            vval = float(w.V_override_m3h) if w.V_override_m3h is not None else 0.0
-            new_t = cols[3].number_input("T_override [°C]", key=f"To_{d}_{w_idx}", value=tval, step=0.5)
-            new_v = cols[4].number_input("V_override [m³/h]", key=f"Vo_{d}_{w_idx}", value=vval, min_value=0.0, max_value=500000.0, step=100.0)
-            # Leereingabe als 0 interpretieren → 0 = aus / nur Temp
-            day.windows[w_idx].T_override_C = float(new_t) if new_t != 0.0 else None
-            day.windows[w_idx].V_override_m3h = float(new_v) if new_v != 0.0 else None
-            if cols[5].button("–", key=f"del_{d}_{w_idx}"):
-                to_del = w_idx
-        if to_del is not None:
-            day.windows.pop(to_del)
+        # NORMAl
+        st.markdown("_Normalbetrieb (T & V standardmäßig aus Abschnitt 2)_")
+        ncols = st.columns([1,1,1,1,0.7])
+        if st.button("+ Normal-Fenster", key=f"add_n_{d}"):
+            day.normal.append(Zeitfenster("08:00","16:00",True,defaults.T_normal_C,None))
             st.experimental_rerun()
-        if st.button("+ Fenster", key=f"add_{d}"):
-            day.windows.append(Window("06:30","17:00","Normal"))
+        del_n = None
+        for i, f in enumerate(day.normal):
+            f.start = ncols[0].text_input("Start", key=f"n_s_{d}_{i}", value=f.start)
+            f.ende  = ncols[1].text_input("Ende",  key=f"n_e_{d}_{i}", value=f.ende)
+            f.aktiv = ncols[2].checkbox("aktiv", key=f"n_a_{d}_{i}", value=f.aktiv)
+            f.T_soll_C = ncols[3].number_input("T_soll [°C]", key=f"n_t_{d}_{i}", value=float(f.T_soll_C), step=0.5)
+            if ncols[4].button("–", key=f"n_del_{d}_{i}"): del_n = i
+        if del_n is not None:
+            day.normal.pop(del_n); st.experimental_rerun()
+
+        # ABSENK
+        st.markdown("_Absenkbetrieb (eigene T & ggf. V)_")
+        acols = st.columns([1,1,1,1,1,0.7])
+        if st.button("+ Absenk-Fenster", key=f"add_a_{d}"):
+            day.absenk.append(Zeitfenster("17:00","06:30",True,defaults.T_absenk_C,defaults.V_absenk_m3h))
             st.experimental_rerun()
+        del_a = None
+        for i, f in enumerate(day.absenk):
+            f.start = acols[0].text_input("Start", key=f"a_s_{d}_{i}", value=f.start)
+            f.ende  = acols[1].text_input("Ende",  key=f"a_e_{d}_{i}", value=f.ende)
+            f.aktiv = acols[2].checkbox("aktiv", key=f"a_a_{d}_{i}", value=f.aktiv)
+            f.T_soll_C = acols[3].number_input("T_soll [°C]", key=f"a_t_{d}_{i}", value=float(f.T_soll_C), step=0.5)
+            vval = 0.0 if f.V_m3h is None else float(f.V_m3h)
+            newv = acols[4].number_input("V [m³/h] (0 = Standard)", key=f"a_v_{d}_{i}", value=vval, min_value=0.0, max_value=500000.0, step=100.0)
+            f.V_m3h = None if newv == 0.0 else float(newv)
+            if acols[5].button("–", key=f"a_del_{d}_{i}"): del_a = i
+        if del_a is not None:
+            day.absenk.pop(del_a); st.experimental_rerun()
 
 # ---------- 4) Berechnen ----------
-if st.button("Berechnen", type="primary"):
-    try_df = st.session_state["try_df"]
-    if try_df is None or try_df.empty:
-        st.error("Bitte zuerst eine gültige TRY‑CSV laden.")
-    else:
-        plant = Plant(
-            id=plant_id, name=plant_name,
-            V_nominal_m3h=float(V_nominal), units_count=int(units),
-            has_HRV=bool(has_hrv), eta_t=float(eta_t),
-            fan_power_kW=float(fan_kW) if fan_kW is not None else None,
-            SFP_kW_per_m3s=float(SFP) if SFP is not None else None,
-            plan=st.session_state["week_plan"],
-        )
-        m, y = compute(try_df, plant, defaults)
-        st.session_state["monthly_df"] = m
-        st.session_state["yearly_df"]  = y
-        st.success("Berechnung abgeschlossen.")
+def _do_calc():
+    df = st.session_state["try_df"]
+    if df is None or df.empty:
+        st.error("Bitte zuerst eine gültige TRY‑CSV laden."); return
+    anlage = Anlage(
+        id=anlage_id, name=anlage_name,
+        V_nominal_m3h=float(V_nominal), anzahl=int(anzahl),
+        wrg=bool(wrg), eta_t=float(eta_t),
+        fan_kW=float(fan_kW) if fan_kW is not None else None,
+        SFP_kW_per_m3s=float(SFP) if SFP is not None else None,
+        wochenplan=st.session_state["wochenplan"]
+    )
+    monat, jahr, prot = berechne(df, anlage, defaults)
+    st.session_state["monat_df"] = monat
+    st.session_state["jahr_df"] = jahr
+    st.session_state["protokoll_df"] = prot
+    st.success("Berechnung abgeschlossen.")
 
-# ---------- 5) Ergebnisse & Exporte ----------
-m = st.session_state["monthly_df"]; y = st.session_state["yearly_df"]
-if m is not None and y is not None:
+if st.button("Berechnen", type="primary"):
+    _do_calc()
+
+# Auto-Calc nach Upload
+if st.session_state["trigger_recalc"]:
+    _do_calc()
+    st.session_state["trigger_recalc"] = False
+
+# ---------- 5) Ergebnisse – sichtbar, dann Download ----------
+m = st.session_state["monat_df"]; j = st.session_state["jahr_df"]; p = st.session_state["protokoll_df"]
+if m is not None and j is not None:
     # Anzeige gerundet
-    m_view = m.copy(); y_view = y.copy()
+    m_view = m.copy(); j_view = j.copy()
     for col in ("kWh_th","kWh_el"):
         if col in m_view: m_view[col] = m_view[col].round(0)
-        if col in y_view: y_view[col] = y_view[col].round(0)
-    if "fan_hours" in m_view: m_view["fan_hours"] = m_view["fan_hours"].round(1)
-    if "fan_hours" in y_view: y_view["fan_hours"] = y_view["fan_hours"].round(1)
+        if col in j_view: j_view[col] = j_view[col].round(0)
+    if "Betriebsstunden_Vent" in m_view: m_view["Betriebsstunden_Vent"] = m_view["Betriebsstunden_Vent"].round(1)
+    if "Betriebsstunden_Vent" in j_view: j_view["Betriebsstunden_Vent"] = j_view["Betriebsstunden_Vent"].round(1)
 
-    st.subheader("Ergebnisse – Monate")
+    st.subheader("Ergebnisse – Jahreswerte (sichtbar)")
+    st.dataframe(j_view, use_container_width=True)
+
+    st.subheader("Ergebnisse – Monate (sichtbar)")
     st.dataframe(m_view, use_container_width=True)
-    st.subheader("Jahressumme")
-    st.dataframe(y_view, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Excel (gesamt) .xlsx", build_excel(
-        Plant(plant_id, plant_name, float(V_nominal), int(units), bool(has_hrv), float(eta_t),
-              float(fan_kW) if fan_kW is not None else None,
-              float(SFP) if SFP is not None else None,
-              st.session_state["week_plan"]),
-        m_view, y_view
-    ), file_name="Heizenergie_Monate_und_Jahr.xlsx")
-
-    c2.download_button("Monate nur .xlsx", build_excel_months(m_view),
-                       file_name="Heizenergie_Monate.xlsx")
-
-    c3.download_button("Monate .csv", m_view.to_csv(index=False).encode("utf-8"),
-                       file_name="Heizenergie_Monate.csv", mime="text/csv")
-
-    if REPORTLAB_OK:
-        c4.download_button("PDF (ISO 50001)", build_pdf(
-            st.session_state.get("try_info",""), defaults,
-            Plant(plant_id, plant_name, float(V_nominal), int(units), bool(has_hrv), float(eta_t),
-                  float(fan_kW) if fan_kW is not None else None,
-                  float(SFP) if SFP is not None else None,
-                  st.session_state["week_plan"]),
-            m_view, y_view
-        ), file_name="ISO50001_Heizenergiebericht.pdf", mime="application/pdf")
+    st.subheader("Stunden‑Protokoll (Ausschnitt zur Kontrolle)")
+    if p is not None and not p.empty:
+        st.dataframe(p.head(100), use_container_width=True)
     else:
-        st.info("PDF‑Export: Paket 'reportlab' nicht installiert (requirements.txt).")
+        st.info("Kein Protokoll verfügbar.")
+
+    # Plausibilitäts-Checks
+    st.subheader("Plausibilitäts‑Check")
+    if not j_view.empty:
+        th = float(j_view["kWh_th"].sum())
+        el = float(j_view["kWh_el"].sum())
+        hints = []
+        if th <= 0: hints.append("Wärmebedarf = 0 kWh → Prüfe Soll‑Temperaturen und Zeitfenster.")
+        if th > 10_000_000: hints.append("Sehr hoher Wärmebedarf (>10 GWh) → Prüfe Volumenstrom/Zeiten/Formel.")
+        if el > th*0.5: hints.append("Ventilatorstrom sehr hoch im Verhältnis zur Wärme → SFP/Fan‑Werte prüfen.")
+        if hints:
+            for h in hints: st.warning(h)
+        else:
+            st.success("Werte im erwartbaren Bereich (grober Heuristik‑Check).")
+
+    # Downloads UNTER den Tabellen
+    st.subheader("Downloads")
+    c1, c2, c3 = st.columns(3)
+    c1.download_button("Excel (Monate + Jahr + Protokoll)", build_excel(m_view, j_view, p if p is not None else pd.DataFrame()),
+                       file_name="Heizenergie_Auswertung.xlsx")
+    c2.download_button("CSV – Monate (sichtbar)", m_view.to_csv(index=False).encode("utf-8"),
+                       file_name="Heizenergie_Monate.csv", mime="text/csv")
+    if REPORTLAB_OK:
+        # Dummy-Anlage nur für PDF-Kopf
+        anlage_dummy = Anlage(anlage_id, anlage_name, float(V_nominal), int(anzahl), bool(wrg), float(eta_t),
+                              float(fan_kW) if fan_kW is not None else None,
+                              float(SFP) if SFP is not None else None,
+                              st.session_state["wochenplan"])
+        st.download_button("PDF – ISO 50001 Kurzbericht",
+                           build_pdf(st.session_state["try_info"], defaults, anlage_dummy, m_view, j_view),
+                           file_name="ISO50001_Heizenergiebericht.pdf", mime="application/pdf")
+    else:
+        st.info("PDF‑Export: Paket 'reportlab' nicht installiert.")
